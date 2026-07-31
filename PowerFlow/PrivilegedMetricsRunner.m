@@ -32,7 +32,10 @@ static NSString * const MPFStagedInstallerPath =
 static const char * const MPFSystemInstallPath = "/usr/bin/install";
 static NSTimeInterval const MPFConnectionTimeout = 8.0;
 static NSUInteger const MPFMatchingHelperRetryLimit = 3;
+static NSUInteger const MPFSamplingStartRetryLimit = 16;
 static NSInteger const MPFProtocolVersion = 1;
+static NSString * const MPFRetryableSessionBusyMarker =
+    @"MPF_RETRY_SESSION_BUSY";
 
 @interface MPFPrivilegedMetricsRunner ()
     <MPFPrivilegedMetricsClientProtocol> {
@@ -46,6 +49,7 @@ static NSInteger const MPFProtocolVersion = 1;
     NSUInteger _compatibleGeneration;
     NSUInteger _connectionFailureCount;
     NSUInteger _matchingHelperRetryCount;
+    NSUInteger _samplingStartRetryCount;
     NSXPCConnection *_connection;
     id<MPFPrivilegedMetricsServiceProtocol> _serviceProxy;
     MPFPrivilegedMetricsDataHandler _dataHandler;
@@ -99,6 +103,7 @@ static NSInteger const MPFProtocolVersion = 1;
         _helperWasCompatible = NO;
         _connectionFailureCount = 0;
         _matchingHelperRetryCount = 0;
+        _samplingStartRetryCount = 0;
         _dataHandler = [dataHandler copy];
         _stateHandler = [stateHandler copy];
     }
@@ -259,6 +264,15 @@ static NSInteger const MPFProtocolVersion = 1;
     _helperWasCompatible = YES;
     _compatibleGeneration = generation;
     _connectionFailureCount = 0;
+    _samplingStartRetryCount = 0;
+
+    [self requestSamplingForGeneration:generation];
+}
+
+- (void)requestSamplingForGeneration:(NSUInteger)generation {
+    if (generation != _connectionGeneration || [self isStopRequested]) {
+        return;
+    }
 
     __weak typeof(self) weakSelf = self;
     [_serviceProxy startSamplingWithReply:^(
@@ -278,10 +292,42 @@ static NSInteger const MPFProtocolVersion = 1;
                 return;
             }
             if (!started) {
+                BOOL isRetryableSessionHandoff =
+                    [errorMessage containsString:
+                        MPFRetryableSessionBusyMarker]
+                    || [errorMessage containsString:
+                        @"Another MacPowerFlow connection is already sampling"];
+                if (isRetryableSessionHandoff
+                        && strongSelf->_samplingStartRetryCount
+                            < MPFSamplingStartRetryLimit) {
+                    ++strongSelf->_samplingStartRetryCount;
+                    NSTimeInterval delay = MIN(
+                        1.0,
+                        0.25 + 0.1
+                            * (double)strongSelf->_samplingStartRetryCount
+                    );
+                    dispatch_after(
+                        dispatch_time(
+                            DISPATCH_TIME_NOW,
+                            (int64_t)(delay * (double)NSEC_PER_SEC)
+                        ),
+                        strongSelf->_workerQueue,
+                        ^{
+                            [strongSelf requestSamplingForGeneration:generation];
+                        }
+                    );
+                    return;
+                }
+                if (isRetryableSessionHandoff) {
+                    [strongSelf finishFailed:
+                        @"上一轮增强采样未能及时退出，请稍后重新打开 MacPowerFlow。"];
+                    return;
+                }
                 [strongSelf finishFailed:
                     errorMessage ?: @"增强服务无法启动 powermetrics。"];
                 return;
             }
+            strongSelf->_samplingStartRetryCount = 0;
             [strongSelf
                 publishState:MPFPrivilegedMetricsRunnerStateRunning
                      message:nil];

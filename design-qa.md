@@ -1,130 +1,105 @@
-# MacPowerFlow 1.4 Design and Release QA
+# MacPowerFlow 1.5.0 设计与发布 QA
 
-## Comparison target
+## 验收对象
 
-- Source visual truth: user-provided reference screenshot
-- Final Release ZIP, collapsed: local QA artifact
-  `.build/final-1.4.0-release-collapsed.png`
-- Final Release ZIP, secondary details expanded: local QA artifact
-  `.build/final-1.4.0-release-expanded.png`
-- Captured panel: `420 × 752 px`, dark appearance
-- Package: `MacPowerFlow 1.4.0 (5)`, arm64
-- Package SHA-256:
-  `e33a5550b41fbbb28e3f8c254c8b0653daf01c07583a24b5c782c3d7e58987fb`
-- Package size: `1,308,149 bytes`
+- 视觉参考：用户提供的能量流截图。
+- 最终包：`dist/MacPowerFlow-1.5.0.zip`。
+- 版本：`MacPowerFlow 1.5.0 (7)`，Apple Silicon `arm64`。
+- 压缩包大小：`1,324,232 bytes`。
+- SHA-256：
+  `20dca5eeb39bbfb712a78c966dc6e9fbceced532127bfab03e503f7ae2ee96c2`。
+- 面板基准宽度：`420 pt`，深色外观。
 
-The reference has one processor branch. MacPowerFlow intentionally keeps CPU,
-GPU, display, and other power visible as four independent live branches because
-those values are part of the requested product behavior.
+## 能量流与展开态
 
-## Visual thesis and information plan
+- 主图保留适配器、电池、整机、CPU、GPU、显示和其他功耗；CPU
+  和 GPU 只在主图出现，“其他功耗分项”展开后不再重复。
+- 主流道及各支路的厚度按当前功耗分布连续变化，保留 `0.35 s`
+  的过渡动画。极低功耗不会被放大成与高功耗相同的视觉权重。
+- 数值与名称放在与流道连体、但拥有独立安全区的终点节点中。节点不随极窄
+  流道继续缩小，因此动态变化时文字不会越过边框、被曲线遮挡或与相邻支路重叠。
+- 电池与适配器改为紧凑的独立节点；充电时使用绿色，未充电时使用系统
+  标签色。菜单栏电池内只保留数字，不显示百分号、分隔点或追加空格。
+- 界面不再显示“实测”、“估算”或 `≈` 等来源前缀；展开区保留紧凑数值，
+  数据口径放在 README 中说明。
 
-The interface is a compact graphite instrument panel. Green is reserved for the
-charging state; otherwise hierarchy comes from spacing, scale, and restrained
-gray contrast. The first screen moves from source and charge state, through one
-dominant energy-flow visual, to optional secondary channels and then detailed
-electrical and thermal readings.
+## 六组连续真实采样
 
-The only continuous layout motion is the `0.35 s` power-flow transition.
-Branch thickness, label position, compact/two-line label mode, and terminal cap
-height all move from the same live values. The secondary-channel disclosure is
-the other deliberate layout transition.
+在真实硬件采样下连续观察 6 组刷新，而非只使用固定预览数据：
 
-## Label-containment pass
+| 采样 | 整机 | CPU | GPU | 显示 | 其他 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 33.9 W | 16.1 W | 1.1 W | 3.0 W | 13.7 W |
+| 2 | 33.6 W | 16.2 W | 1.1 W | 3.0 W | 13.3 W |
+| 3 | 33.6 W | 16.6 W | 1.1 W | 3.0 W | 12.9 W |
+| 4 | 37.9 W | 24.7 W | 5.8 W | 3.0 W | 4.4 W |
+| 5 | 45.6 W | 21.0 W | 5.5 W | 3.0 W | 16.2 W |
+| 6 | 42.6 W | 15.8 W | 6.8 W | 3.0 W | 17.0 W |
 
-- CPU, GPU, display, and other branch heights are calculated from the current
-  power distribution rather than fixed percentages.
-- Each branch label samples the narrowest height across its full horizontal
-  span, subtracts an internal safety margin, and switches between a two-line
-  value/label or a compact single line.
-- Every main branch label is masked by the exact animating
-  `FlowRibbonShape`; a glyph cannot paint outside either curved edge during a
-  value change.
-- The upper battery/secondary-source connector is now also a real dynamic
-  ribbon. Its height follows battery power with a readable minimum, its compact
-  value has no artificial space before `W`, and the value is masked by that
-  ribbon.
-- The final Release was observed at two substantially different live samples:
-  CPU `≈17.0 → ≈22.3 W`, GPU `≈1.0 → ≈1.5 W`, and other
-  `≈20.6 → ≈11.0 W`. The zero-flow `0.0W` secondary label and all four branch
-  labels remained inside their borders.
+- 6 组数据均满足“整机 = CPU + GPU + 显示 + 其他”，仅存在界面显示到
+  `0.1 W` 的舍入误差，没有负数支路。
+- 在这 6 次实时改变中，折叠态和展开态均未发现流道交叉、文字越界、
+  节点相互覆盖、卡片碰撞或边缘裁切。
+- 还以 `0 / 0.1 / 1 / 10 / 100 / 500 W` 的边界输入检查了零流量、极细支路和
+  极端比例，文字仍保持在安全节点内。
 
-## Layout, color, and content pass
+## SMC 与 IOReport 数据验证
 
-- The `420 px` panel preserves the reference's compact pill row, charge rail,
-  source/system/consumer silhouette, and dense detail rhythm.
-- The top row has one compact refresh control. No administrator shield or
-  separator dot consumes permanent space.
-- CPU and GPU appear only in the main energy visual. The expanded secondary
-  section does not duplicate them and instead lists available ANE, memory,
-  media, ISP, fabric, PCIe, or activity clues.
-- “Other” is explicitly presented as a residual estimate and explains what may
-  be included without inventing unavailable sensor wattages.
-- The menu item renderer uses one composite image: percentage digits sit inside
-  the battery body, the percent sign is omitted, and system load starts exactly
-  at the battery canvas edge with no title separator or appended blank.
-- Charging colors the battery, bolt, and digits green. Noncharging uses the
-  semantic system label color.
-- Collapsed and expanded views show no overlap, broken wrapping, card collision,
-  or edge clipping.
+- 在本机 M1 Pro 上通过 AppleSMC `#KEY` 枚举到 `2,131 / 2,131` 个键，其中
+  `1,684` 个可按已知数值类型解码。
+- 数值解码覆盖浮点、有/无符号整数和定点类型；实际 `0` 与缺失、不支持、
+  读取失败分开保留。
+- 未核对语义的 FourCC 只进入诊断表，不会根据名称猜测后直接映射到产品界面。
+  本机实际验证了 `PSTR`、`PDTR` 和 `PDBR` 等已知键；Wi-Fi 与 USB 只在
+  `wiPm`、`PUSB` 或已知分端键存在时使用。
+- IOReport 能量差分窗口由 `100 ms` 改为 `500 ms`，低于应用的 2 秒刷新周期，
+  同时减少过短窗口将 GPU 短促活动放大成单帧异常尖峰的问题。
+- 标准 GPU 明显超过同帧可用预算时，回退 8 秒内最近合理值；没有历史值则用 0。
+  小幅跨采样器偏差会钳到预算。管理员 GPU 明显超预算时回退标准通道，CPU、
+  GPU、显示与其他最终都受同一整机预算约束，但原始通道值仍保留供诊断。
+- 只有 `#KEY` 未超过 8,192 且所有索引都成功枚举时，能力表才用于短路“键缺失”；
+  枚举失败或被安全上限截断时，已知键仍会直接读取，不会在本次会话中被永久误判。
+- “其他”仍由整机功耗扣除 CPU、GPU 和显示后取非负残差；最终 6 组连续采样
+  均未再出现 GPU 瞬时值大于整机、导致 CPU 被挤为零的不可能流图。
 
-## Accessibility and interaction pass
+## 增强服务、重启与登录启动
 
-- The final extracted Release was launched with `--preview`, then its real
-  accessibility disclosure button was used to expand the secondary details.
-- The energy-flow accessibility value includes source, battery, system, CPU,
-  GPU, display, and other wattages.
-- Tray accessibility retains the full percentage and charging state even though
-  the visible percent sign is intentionally omitted.
-- Refresh and disclosure remain keyboard/accessibility buttons with descriptive
-  labels.
+- 冷启动时 `powermetrics` 可在约 10 秒后才产生首个完整 XML 样本；应用端首样
+  看门狗已从 8 秒放宽到 25 秒，稳态新鲜度仍保持 8 秒。
+- helper 在暂无输出时使用两次受控 `SIGINFO` 请求样本，并在启动新流前回收残留子进程；
+  XPC 回调连接在会话期间强引用持有，会话交接使用有界重试。
+- 安装最终包后连续退出并重开主应用 2 次；helper PID `80472` 始终未变，
+  最终主应用 PID 为 `80733`，`powermetrics` 恰好 1 个。未见 `SecurityAgent` 或
+  `authorizationhost`，13 秒后三个进程仍稳定。
+- 通过应用自身的“登录时启动”菜单执行 `SMAppService.mainApp.register()`；最终包
+  重启后读取 `SMAppService.mainApp.status.rawValue == 1`，即 `.enabled`。
+- 最终 XPC 服务仍只暴露版本、开始采样和停止采样三个操作；不接受命令、
+  可执行路径、参数、环境变量或输出路径。
 
-## Privileged-service security pass
+## 构建、签名与安装验证
 
-- The root XPC service exposes only protocol-version, start-sampling, and
-  stop-sampling operations. It accepts no executable path, shell command,
-  argument list, environment, or output path from the app.
-- `/usr/bin/powermetrics` uses one compile-time path and argument list.
-- The helper launches it with `posix_spawn` without
-  `POSIX_SPAWN_SETPGROUP`, tracks its exact PID, sends TERM then bounded KILL,
-  and reaps it with `waitpid`.
-- First approval stages the prevalidated helper and installer through the
-  system `/usr/bin/install` into fixed `root:wheel 0555` paths. The app
-  recomputes identifier plus CDHash from those root-owned copies before the
-  staged installer can execute.
-- The staged installer accepts only the exact app requirement and invoking UID,
-  writes only fixed root-owned destinations, and removes both staging files.
-- A matching installed helper receives three connection retries before any
-  reinstall decision, avoiding a password prompt caused only by slow launchd
-  startup.
-- The real root installation was intentionally not performed during automated
-  QA; the user's first normal launch remains the approval point.
+- Debug `arm64` 构建通过，Swift 和 Objective-C 警告按错误处理。
+- Release `arm64` 构建和静态分析通过，Swift/GCC 警告按错误处理。
+- 发布脚本生成最终 ZIP 后重新解包验证；helper、installer 和外层 App 均通过
+  `codesign --verify --strict`，解包后没有额外扩展属性输出。
+- 发布暂存先从 Git 对象库恢复未修改的跟踪文件，再叠加当前差异和非忽略新文件；
+  即使 Documents/File Provider 把未修改图标或许可证逐出为 `dataless`，也不会卡住构建。
+- 解包后的主程序为 Mach-O 64-bit `arm64`，`CFBundleShortVersionString` 与
+  `CFBundleVersion` 分别为 `1.5.0` 和 `7`。
+- 最终应用使用固定 `/Applications/MacPowerFlow.app` 路径验证；旧版本在替换前移入
+  `.build/previous-releases/`，没有直接删除用户副本。
+- 已安装 App 的最终 CDHash 为
+  `e5a03e7227d561525cf4f6023f9ca96bf2dfa646`；helper 和配置文件均为
+  `root:wheel`，配置内的客户端要求精确固定同一 CDHash。
 
-## Build and package verification
+Xcode 输出中仍可见主机 CoreSimulator 1051.54/1051.55 版本不匹配日志。该日志与
+macOS `arm64` 目标无关；上述 macOS 构建、分析、签名、解包和实机运行检查均已完成。
 
-- Debug arm64 build with Swift and Objective-C warnings treated as errors:
-  passed.
-- Release static analysis with warnings treated as errors: passed.
-- Installer Swift warnings-as-errors typecheck: passed.
-- Project plist lint and release-script shell syntax: passed.
-- Release ZIP was extracted and the outer app, helper, and installer all passed
-  strict code-signature verification.
-- Extracted binary: Mach-O 64-bit arm64.
-- Extracted version/build: `1.4.0 (5)`.
-- Security scan found no shell, `popen`, `system`, or `sudoers` interface in the
-  shared service, helper, XPC protocol, or privileged runner.
+## 发布限制
 
-Xcode reports a host-only CoreSimulator 1051.54/1051.55 version mismatch.
-Simulator support is unrelated to this macOS target; all macOS build, analysis,
-signing, archive extraction, and runtime visual checks completed successfully.
-
-## Platform limitation
-
-This local package is hardened ad-hoc signed and binds the installed helper to
-the exact 1.4.0 App CDHash. The same binary remains password-free across app
-relaunches and Mac reboots. Rebuilding or upgrading the app changes that hash
-and therefore requires one new approval. Stable cross-version identity requires
-a Developer ID Application certificate, notarization, and an
-`SMAppService`-based LaunchDaemon.
+当前包使用 hardened ad-hoc 签名，helper 通过精确 CDHash 绑定已安装的 1.5.0 App。
+同一个二进制在日常重启和 Mac 重启后不需再次输入密码；以后重建或升级 App 会
+改变 CDHash，因此需要对新二进制批准一次。要在跨版本升级后继续保持稳定身份，
+仍需 Developer ID Application 签名、公证与基于 `SMAppService` 的 LaunchDaemon。
 
 final result: passed

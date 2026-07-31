@@ -100,6 +100,8 @@ final class PowerMonitor: ObservableObject {
     @Published private(set) var pciePowerWatts = 0.0
     @Published private(set) var displaySoCPowerWatts = 0.0
     @Published private(set) var displayExternalControllerPowerWatts = 0.0
+    @Published private(set) var wifiPowerWatts = 0.0
+    @Published private(set) var usbPowerWatts = 0.0
     @Published private(set) var cpuUsagePercent = 0.0
     @Published private(set) var gpuUsagePercent = -1.0
     @Published private(set) var cpuTempC = 0.0
@@ -129,6 +131,17 @@ final class PowerMonitor: ObservableObject {
     @Published private(set) var thermalStateText = "正常"
     @Published private(set) var lowPowerModeEnabled = false
     @Published private(set) var topProcesses: [ActivityProcess] = []
+
+    // MARK: - SMC capability diagnostics
+
+    /// Exposed to diagnostics/support code, not as user-facing sensor labels.
+    /// Unknown firmware keys remain metadata only until their meaning has been
+    /// independently established for a hardware family.
+    @Published private(set) var smcCapabilityCount = 0
+    @Published private(set) var smcNumericCapabilityCount = 0
+    @Published private(set) var smcKnownReadableKeyCount = 0
+    private(set) var smcReadings: [String: SMCReading] = [:]
+    private(set) var smcCapabilities: [String: SMCCapability] = [:]
 
     // MARK: - Persistent privileged sampling
 
@@ -164,6 +177,16 @@ final class PowerMonitor: ObservableObject {
     private var previousCPUTicks: [[UInt32]] = []
     private var administratorStartupWatchdogTask: Task<Void, Never>?
     private var administratorTerminalError: String?
+    private var lastReasonableStandardGPUPowerWatts: Double?
+    private var lastReasonableStandardGPUSampleDate = Date.distantPast
+
+    /// SMC, IOReport and powermetrics do not close their sampling windows at
+    /// exactly the same instant. Accept a small one-frame overshoot, then clamp
+    /// it to the physical budget; a larger overshoot is treated as an invalid
+    /// sample rather than being allowed to consume the CPU/other branches.
+    private let componentBudgetAbsoluteToleranceWatts = 1.0
+    private let componentBudgetRelativeTolerance = 0.10
+    private let standardGPUFallbackFreshness: TimeInterval = 8
 
     init() {
         chipName = Self.sysctlString("machdep.cpu.brand_string")
@@ -230,25 +253,59 @@ final class PowerMonitor: ObservableObject {
             await sampler.close()
         }
         previousCPUTicks.removeAll(keepingCapacity: true)
+        lastReasonableStandardGPUPowerWatts = nil
+        lastReasonableStandardGPUSampleDate = .distantPast
         isSampling = false
     }
 
     // MARK: - Administrator sampling
 
+    var effectiveDisplayPowerWatts: Double {
+        guard systemLoadWatts.isFinite, systemLoadWatts > 0.02 else {
+            return 0
+        }
+        return min(nonnegativePower(displayPowerWatts), systemLoadWatts)
+    }
+
+    private var availableProcessorPowerBudgetWatts: Double {
+        guard systemLoadWatts.isFinite, systemLoadWatts > 0.02 else {
+            return 0
+        }
+        return max(0, systemLoadWatts - effectiveDisplayPowerWatts)
+    }
+
     var effectiveCPUPowerWatts: Double {
+        let availableCPU = max(
+            0,
+            availableProcessorPowerBudgetWatts - effectiveGPUPowerWatts
+        )
+        guard availableCPU > 0.02 else { return 0 }
+
+        let candidate: Double
         if administratorSampleIsFresh && administratorCPUHasValue {
-            return administratorCPUPowerWatts
+            candidate = administratorCPUPowerWatts
+        } else if cpuPowerWatts > 0.02 {
+            candidate = cpuPowerWatts
+        } else {
+            candidate = estimatedCPUPowerWatts
         }
-        if cpuPowerWatts > 0.02 {
-            return cpuPowerWatts
-        }
-        return estimatedCPUPowerWatts
+        return min(nonnegativePower(candidate), availableCPU)
     }
 
     var effectiveGPUPowerWatts: Double {
-        administratorSampleIsFresh && administratorGPUHasValue
-            ? administratorGPUPowerWatts
-            : gpuPowerWatts
+        let budget = availableProcessorPowerBudgetWatts
+        guard budget > 0.02 else { return 0 }
+
+        let standard = min(nonnegativePower(gpuPowerWatts), budget)
+        guard administratorSampleIsFresh, administratorGPUHasValue else {
+            return standard
+        }
+
+        let administrator = nonnegativePower(administratorGPUPowerWatts)
+        guard !isClearlyAbovePowerBudget(administrator, budget: budget) else {
+            return standard
+        }
+        return min(administrator, budget)
     }
 
     var effectiveANEPowerWatts: Double {
@@ -263,7 +320,7 @@ final class PowerMonitor: ObservableObject {
             systemLoadWatts
                 - effectiveCPUPowerWatts
                 - effectiveGPUPowerWatts
-                - displayPowerWatts
+                - effectiveDisplayPowerWatts
         )
     }
 
@@ -311,6 +368,18 @@ final class PowerMonitor: ObservableObject {
                 label: "PCIe 汇总",
                 powerWatts: pciePowerWatts,
                 basis: "IOReport 通道"
+            ),
+            OtherPowerComponent(
+                id: "wifi",
+                label: "无线网络",
+                powerWatts: wifiPowerWatts,
+                basis: "SMC wiPm"
+            ),
+            OtherPowerComponent(
+                id: "usb",
+                label: "USB 总线",
+                powerWatts: usbPowerWatts,
+                basis: "SMC USB 功耗轨"
             )
         ]
         .filter { $0.powerWatts > 0.02 && $0.powerWatts.isFinite }
@@ -328,8 +397,8 @@ final class PowerMonitor: ObservableObject {
     }
 
     /// Honest, activity-shaped allocation of the part of "other" for which no
-    /// independent watt channel exists. These are not invented sensors: each
-    /// row is marked as an estimate and names its proxy signal in `basis`.
+    /// independent watt channel exists. These are not invented sensors;
+    /// provenance remains in `basis` for diagnostics while the UI stays compact.
     ///
     /// Four non-overlapping system buckets are always present. Up to two more
     /// are added only when their corresponding direct channels are absent, so
@@ -415,13 +484,16 @@ final class PowerMonitor: ObservableObject {
 
         // macOS does not expose portable watt channels for these four groups.
         // They never duplicate the CPU/GPU/display or the direct domains above.
-        seeds.append(contentsOf: [
-            (
+        if !directIDs.contains("wifi") {
+            seeds.append((
                 id: "estimated-network",
                 label: "网络与无线",
                 basis: "整机活动代理",
                 weight: 0.65 + 0.45 * loadSignal
-            ),
+            ))
+        }
+
+        seeds.append(contentsOf: [
             (
                 id: "estimated-cooling",
                 label: "风扇与散热",
@@ -482,16 +554,17 @@ final class PowerMonitor: ObservableObject {
     ///
     /// Prefer a residual from the SoC estimate when one exists. Otherwise
     /// allocate a conservative, utilization-shaped share of whole-system load.
-    /// The UI always marks this value with `≈`.
+    /// Provenance stays internal so the compact UI does not need a prefix.
     private var estimatedCPUPowerWatts: Double {
+        let reconciledGPU = effectiveGPUPowerWatts
         let availableSystemPower = max(
             0,
-            systemLoadWatts - gpuPowerWatts - displayPowerWatts
+            availableProcessorPowerBudgetWatts - reconciledGPU
         )
         guard availableSystemPower > 0.02 else { return 0 }
 
         let knownSoCPower =
-            gpuPowerWatts + anePowerWatts + dramPowerWatts
+            reconciledGPU + anePowerWatts + dramPowerWatts
         let socResidual = processorPowerWatts - knownSoCPower
         if socResidual > 0.02 {
             return min(availableSystemPower, socResidual)
@@ -632,7 +705,11 @@ final class PowerMonitor: ObservableObject {
         administratorStartupWatchdogTask?.cancel()
         administratorStartupWatchdogTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: 8_000_000_000)
+                // `powermetrics` may need roughly ten seconds to emit its
+                // first complete plist after a cold helper launch. Keep this
+                // watchdog comfortably above that measured startup latency;
+                // steady-state freshness is still checked separately.
+                try await Task.sleep(nanoseconds: 25_000_000_000)
             } catch {
                 return
             }
@@ -642,7 +719,7 @@ final class PowerMonitor: ObservableObject {
                 return
             }
 
-            let message = "增强服务已启动，但 8 秒内没有收到兼容的 CPU / GPU 数据。"
+            let message = "增强服务已启动，但 25 秒内没有收到兼容的 CPU / GPU 数据。"
             self.administratorTerminalError = message
             self.administratorErrorMessage = message
             self.administratorSamplingState = .stopping
@@ -662,6 +739,13 @@ final class PowerMonitor: ObservableObject {
     }
 
     private func apply(_ snapshot: HardwareSnapshot) {
+        smcReadings = snapshot.smcReadings
+        smcCapabilities = snapshot.smcCapabilities
+        smcCapabilityCount = snapshot.smcCapabilityCount
+        smcNumericCapabilityCount = snapshot.smcNumericCapabilityCount
+        smcKnownReadableKeyCount = snapshot.smcReadings.values.reduce(0) {
+            $0 + ($1.status == .available ? 1 : 0)
+        }
         updateBattery(from: snapshot.battery, smc: snapshot.smcValues)
         updateProcessor(from: snapshot.processor, smc: snapshot.smcValues)
         updatePowerFlow(
@@ -800,30 +884,6 @@ final class PowerMonitor: ObservableObject {
             data.displayExtPower
         )
 
-        let componentPower =
-            cpuPowerWatts + gpuPowerWatts + anePowerWatts + dramPowerWatts
-        // Linux's upstream macsmc driver documents PHPC as the SoC heat
-        // dissipation estimate. It is a useful fallback on macOS builds where
-        // IOReport temporarily stops publishing per-component energy.
-        let socHeatEstimate = smcPower(smc, "PHPC")
-        if socHeatEstimate > 0 {
-            processorPowerWatts = socHeatEstimate
-            processorPowerIsEstimated = true
-            processorPowerIsPartial = false
-        } else if componentPower > 0 {
-            // These four IOReport domains are useful, but they do not represent
-            // every SoC rail. Keep both the approximation and partial-data
-            // semantics explicit so the UI never presents their sum as a
-            // complete package measurement.
-            processorPowerWatts = componentPower
-            processorPowerIsEstimated = true
-            processorPowerIsPartial = true
-        } else {
-            processorPowerWatts = 0
-            processorPowerIsEstimated = false
-            processorPowerIsPartial = false
-        }
-
         if let temperature = validTemperature(data.cpuTemp) {
             cpuTempC = temperature
         } else if let temperature = validTemperature(smcTemperature(
@@ -864,8 +924,8 @@ final class PowerMonitor: ObservableObject {
     ) {
         let smcAdapter = smcPower(smc, "PDTR")
         adapterInputWatts = firstPositive(
-            battery.systemInputWatts,
-            smcAdapter
+            smcAdapter,
+            battery.systemInputWatts
         )
 
         let smcSystem = smcPower(smc, "PSTR")
@@ -884,8 +944,8 @@ final class PowerMonitor: ObservableObject {
         }
 
         let measuredSystemLoad = firstPositive(
-            battery.systemLoadWatts,
             smcSystem,
+            battery.systemLoadWatts,
             processor.systemPower
         )
         systemLoadIsEstimated = measuredSystemLoad == 0 && balanceEstimate > 0
@@ -893,20 +953,111 @@ final class PowerMonitor: ObservableObject {
 
         // PBwo is used by newer Apple Silicon systems; PDBR is present on
         // several M1–M4 MacBook Pro models.
-        displayPowerWatts = firstPositive(
-            smcPower(smc, "PBwo"),
-            smcPower(smc, "PDBR")
-        )
+        if smcReadings["PBwo"]?.status == .available {
+            displayPowerWatts = nonnegativePower(smc["PBwo"] ?? 0)
+        } else {
+            displayPowerWatts = nonnegativePower(smcPower(smc, "PDBR"))
+        }
+
+        reconcileStandardGPUPowerAgainstCurrentBudget()
+        updateProcessorAggregatePower(smc: smc)
+
+        // These rails are used only when an independently known FourCC is
+        // present and decodes through a known SMC numeric type. Aggregate wins;
+        // per-port keys are fallbacks and are not double-counted.
+        wifiPowerWatts = nonnegativePower(smcPower(smc, "wiPm"))
+        if smcReadings["PUSB"]?.status == .available {
+            // A present aggregate reporting a real 0 W is authoritative; do
+            // not replace it with a possibly asynchronous per-port sample.
+            usbPowerWatts = nonnegativePower(smc["PUSB"] ?? 0)
+        } else {
+            usbPowerWatts = smcPowerSum(smc, "PUS0", "PUS1", "PUS2")
+        }
 
         // "Other" is a residual bucket. Keeping it nonnegative prevents
         // asynchronously sampled rails from creating an impossible UI flow.
+        let standardCPU = min(
+            nonnegativePower(cpuPowerWatts),
+            max(0, availableProcessorPowerBudgetWatts - gpuPowerWatts)
+        )
         otherPowerWatts = max(
             0,
             systemLoadWatts
-                - cpuPowerWatts
+                - standardCPU
                 - gpuPowerWatts
-                - displayPowerWatts
+                - effectiveDisplayPowerWatts
         )
+    }
+
+    private func reconcileStandardGPUPowerAgainstCurrentBudget() {
+        let candidate = nonnegativePower(gpuPowerWatts)
+        guard systemLoadWatts.isFinite, systemLoadWatts > 0.02 else {
+            // Preserve the raw standard source for diagnostics when no whole-
+            // system budget exists yet. Effective UI values remain zero until
+            // the budget is known, so the main diagram cannot become invalid.
+            gpuPowerWatts = candidate
+            return
+        }
+
+        let budget = availableProcessorPowerBudgetWatts
+        let now = Date()
+        if isClearlyAbovePowerBudget(candidate, budget: budget) {
+            let age = now.timeIntervalSince(lastReasonableStandardGPUSampleDate)
+            if let previous = lastReasonableStandardGPUPowerWatts,
+               age >= 0,
+               age <= standardGPUFallbackFreshness {
+                gpuPowerWatts = min(previous, budget)
+            } else {
+                gpuPowerWatts = 0
+            }
+            return
+        }
+
+        // A small cross-sampler overshoot is plausible, but the value rendered
+        // in the energy flow must still fit the physical whole-system budget.
+        let reconciled = min(candidate, budget)
+        gpuPowerWatts = reconciled
+        lastReasonableStandardGPUPowerWatts = reconciled
+        lastReasonableStandardGPUSampleDate = now
+    }
+
+    private func isClearlyAbovePowerBudget(
+        _ value: Double,
+        budget: Double
+    ) -> Bool {
+        let safeValue = nonnegativePower(value)
+        let safeBudget = nonnegativePower(budget)
+        let tolerance = max(
+            componentBudgetAbsoluteToleranceWatts,
+            safeBudget * componentBudgetRelativeTolerance
+        )
+        return safeValue > safeBudget + tolerance
+    }
+
+    private func updateProcessorAggregatePower(smc: [String: Double]) {
+        let componentPower =
+            cpuPowerWatts + gpuPowerWatts + anePowerWatts + dramPowerWatts
+        // Linux's upstream macsmc driver documents PHPC as the SoC heat
+        // dissipation estimate. It is a useful fallback on macOS builds where
+        // IOReport temporarily stops publishing per-component energy.
+        let socHeatEstimate = smcPower(smc, "PHPC")
+        if socHeatEstimate > 0 {
+            processorPowerWatts = socHeatEstimate
+            processorPowerIsEstimated = true
+            processorPowerIsPartial = false
+        } else if componentPower > 0 {
+            // These four IOReport domains are useful, but they do not represent
+            // every SoC rail. Keep both the approximation and partial-data
+            // semantics explicit so the UI never presents their sum as a
+            // complete package measurement.
+            processorPowerWatts = componentPower
+            processorPowerIsEstimated = true
+            processorPowerIsPartial = true
+        } else {
+            processorPowerWatts = 0
+            processorPowerIsEstimated = false
+            processorPowerIsPartial = false
+        }
     }
 
     private func updateSystemState() {
@@ -955,6 +1106,16 @@ final class PowerMonitor: ObservableObject {
             }
         }
         return count > 0 ? sum / Double(count) : 0
+    }
+
+    private func smcPowerSum(
+        _ values: [String: Double],
+        _ keys: String...
+    ) -> Double {
+        let total = keys.reduce(0) { total, key in
+            total + smcPower(values, key)
+        }
+        return nonnegativePower(total)
     }
 
     // MARK: - CPU host ticks
