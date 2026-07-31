@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.1 — 2026-07-31
+
+- Fixed “登录时启动” on a clean installation: `.notFound` now performs the
+  initial `SMAppService.mainApp.register()` call instead of being treated as a
+  terminal path error.
+- Added explicit pending-approval state, a direct shortcut to Login Items
+  settings, delayed status refresh, and clearer errors for registration races.
+- Replaced the empty “其他功耗分项” state with a live 4–6 item estimate that
+  reacts to system load, memory bandwidth, chip activity, and fan speed.
+- Kept directly readable ANE/DRAM/media/ISP/Fabric/PCIe channels separate from
+  estimated items; every modeled value is marked with `≈` and the modeled sum
+  is bounded by the residual “other” power budget.
+- Verified the expanded 420-point panel with six estimate cards and no text
+  overflow.
+
 ## 1.4.0 — 2026-07-31
 
 - Added dynamic CPU, GPU, display, and residual-power branches whose widths,

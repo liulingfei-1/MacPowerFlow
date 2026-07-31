@@ -7,7 +7,7 @@ project_dir="$(cd -- "${script_dir}/.." && pwd -P)"
 project_file="${project_dir}/MacPowerFlow.xcodeproj"
 scheme="MacPowerFlow"
 product_name="MacPowerFlow.app"
-archive_name="MacPowerFlow-1.4.0.zip"
+archive_name="MacPowerFlow-1.4.1.zip"
 dist_dir="${project_dir}/dist"
 backup_dir="${project_dir}/.build/previous-releases"
 output_archive="${dist_dir}/${archive_name}"
@@ -36,6 +36,7 @@ if [[ -z "${temp_base}" ]]; then
 fi
 
 build_root="$(mktemp -d "${temp_base}/MacPowerFlow.release.XXXXXX")"
+source_root="${build_root}/Source"
 derived_data="${build_root}/DerivedData"
 staged_app="${build_root}/${product_name}"
 staged_archive="${build_root}/${archive_name}"
@@ -51,10 +52,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "正在把构建所需源码暂存到独立目录…"
+mkdir -p "${source_root}"
+for source_item in MacPowerFlow.xcodeproj PowerFlow Shared Helper Installer; do
+    ditto \
+        "${project_dir}/${source_item}" \
+        "${source_root}/${source_item}"
+done
+
 echo "正在构建 MacPowerFlow Release（arm64）…"
 xcodebuild \
     -quiet \
-    -project "${project_file}" \
+    -project "${source_root}/MacPowerFlow.xcodeproj" \
     -scheme "${scheme}" \
     -configuration Release \
     -destination "generic/platform=macOS" \

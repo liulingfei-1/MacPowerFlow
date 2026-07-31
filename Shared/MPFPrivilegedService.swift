@@ -20,7 +20,7 @@ enum MPFPrivilegedService {
     static let embeddedInstallerExecutableName =
         "com.llf.MacPowerFlow.PrivilegedInstaller"
     static let protocolVersion = 1
-    static let helperVersion = "1.4.0"
+    static let helperVersion = "1.4.1"
 
     static let installedHelperPath =
         "/Library/PrivilegedHelperTools/" +
