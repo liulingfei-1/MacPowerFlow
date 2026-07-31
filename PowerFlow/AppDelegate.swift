@@ -19,6 +19,7 @@ final class AppDelegate: NSObject,
     private var launchAtLoginItem: NSMenuItem?
     private var modelObservation: AnyCancellable?
     private var pendingStatusUpdate: DispatchWorkItem?
+    private var pendingLaunchAtLoginStatusUpdate: DispatchWorkItem?
 
     private var isPreviewMode: Bool {
         ProcessInfo.processInfo.arguments.contains("--preview")
@@ -57,6 +58,7 @@ final class AppDelegate: NSObject,
 
     func applicationWillTerminate(_ notification: Notification) {
         pendingStatusUpdate?.cancel()
+        pendingLaunchAtLoginStatusUpdate?.cancel()
         modelObservation?.cancel()
         model.stopMonitoring()
     }
@@ -514,22 +516,33 @@ final class AppDelegate: NSObject,
             switch service.status {
             case .enabled:
                 try service.unregister()
-            case .notRegistered:
+            case .notRegistered, .notFound:
+                guard isRunningFromApplicationsFolder else {
+                    presentMoveToApplicationsMessage()
+                    updateLaunchAtLoginItem()
+                    return
+                }
+
+                // On a clean installation, current macOS releases can report
+                // .notFound until the first register() call creates the BTM
+                // record. Treating .notFound as a terminal error makes it
+                // impossible to enable launch at login for the first time.
                 try service.register()
             case .requiresApproval:
-                SMAppService.openSystemSettingsLoginItems()
-            case .notFound:
-                presentLaunchAtLoginMessage(
-                    "系统找不到可注册的登录项。请先把 MacPowerFlow.app 移到“应用程序”文件夹，再重新打开。"
-                )
+                updateLaunchAtLoginItem()
+                presentLaunchAtLoginApprovalMessage()
+                return
             @unknown default:
                 presentLaunchAtLoginMessage("当前系统无法识别登录项状态。")
             }
         } catch {
-            presentLaunchAtLoginError(error)
+            handleLaunchAtLoginError(error)
+            updateLaunchAtLoginItem()
+            return
         }
 
         updateLaunchAtLoginItem()
+        scheduleLaunchAtLoginStatusRefresh()
     }
 
     private func updateLaunchAtLoginItem() {
@@ -546,11 +559,102 @@ final class AppDelegate: NSObject,
             item.title = "登录时启动（需要在系统设置中批准…）"
             item.state = .mixed
         case .notFound:
-            item.title = "登录时启动（当前不可用）"
+            // Before the first registration, BTM can legitimately have no
+            // record for the main app. Keep this visibly off, not unavailable;
+            // selecting it will perform the initial registration.
+            item.title = "登录时启动"
             item.state = .off
         @unknown default:
             item.title = "登录时启动"
             item.state = .off
+        }
+    }
+
+    private var isRunningFromApplicationsFolder: Bool {
+        let bundleURL = Bundle.main.bundleURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let applicationsURL = URL(
+            fileURLWithPath: "/Applications",
+            isDirectory: true
+        )
+        .resolvingSymlinksInPath()
+        .standardizedFileURL
+
+        return bundleURL.path.hasPrefix(applicationsURL.path + "/")
+    }
+
+    private func scheduleLaunchAtLoginStatusRefresh() {
+        pendingLaunchAtLoginStatusUpdate?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.updateLaunchAtLoginItem()
+
+            if SMAppService.mainApp.status == .requiresApproval {
+                self.presentLaunchAtLoginApprovalMessage()
+            }
+        }
+        pendingLaunchAtLoginStatusUpdate = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 0.5,
+            execute: workItem
+        )
+    }
+
+    private func handleLaunchAtLoginError(_ error: Error) {
+        let nsError = error as NSError
+
+        if nsError.code == kSMErrorLaunchDeniedByUser {
+            updateLaunchAtLoginItem()
+            presentLaunchAtLoginApprovalMessage()
+            return
+        }
+
+        // A concurrent settings change can make the requested transition
+        // finish before our call reaches ServiceManagement. In that case the
+        // current status is authoritative and no error dialog is useful.
+        if nsError.code == kSMErrorAlreadyRegistered,
+           SMAppService.mainApp.status == .enabled
+        {
+            return
+        }
+        if nsError.code == kSMErrorJobNotFound,
+           SMAppService.mainApp.status == .notRegistered
+        {
+            return
+        }
+
+        presentLaunchAtLoginError(error)
+    }
+
+    private func presentMoveToApplicationsMessage() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "请先从“应用程序”文件夹运行"
+        alert.informativeText = "登录时启动需要一个固定的应用路径。请退出 MacPowerFlow，将 MacPowerFlow.app 移到 /Applications，然后从那里重新打开并再次开启此选项。\n\n当前路径：\(Bundle.main.bundleURL.path)"
+        alert.addButton(withTitle: "打开“应用程序”文件夹")
+        alert.addButton(withTitle: "取消")
+
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(
+                URL(fileURLWithPath: "/Applications", isDirectory: true)
+            )
+        }
+    }
+
+    private func presentLaunchAtLoginApprovalMessage() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "还需要在系统设置中批准"
+        alert.informativeText = "MacPowerFlow 已提交登录项注册，但 macOS 当前不允许它自动启动。请在“系统设置 › 通用 › 登录项与扩展”中允许 MacPowerFlow。批准前，菜单会保持“需要批准”状态，不会显示为已开启。"
+        alert.addButton(withTitle: "打开登录项设置")
+        alert.addButton(withTitle: "稍后")
+
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            SMAppService.openSystemSettingsLoginItems()
         }
     }
 

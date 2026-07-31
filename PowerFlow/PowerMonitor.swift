@@ -9,6 +9,17 @@ struct ActivityProcess: Identifiable, Equatable, Sendable {
     let cpuPercent: Double
 }
 
+/// One secondary rail shown below the residual "other" power branch.
+///
+/// `basis` deliberately describes the signal used instead of pretending that
+/// macOS exposes a sensor which does not exist on every Mac model.
+struct OtherPowerComponent: Identifiable, Equatable, Sendable {
+    let id: String
+    let label: String
+    let powerWatts: Double
+    let basis: String
+}
+
 nonisolated enum BatteryFlowDirection: Sendable, Equatable {
     case charging
     case supplying
@@ -254,6 +265,216 @@ final class PowerMonitor: ObservableObject {
                 - effectiveGPUPowerWatts
                 - displayPowerWatts
         )
+    }
+
+    /// Secondary power domains which this Mac currently publishes as watts.
+    /// CPU, GPU, displays and GPU SRAM are intentionally excluded because the
+    /// main flow already accounts for their parent domains.
+    var readableOtherPowerComponents: [OtherPowerComponent] {
+        let aneBasis = administratorSampleIsFresh && administratorANEHasValue
+            ? "增强通道"
+            : "硬件通道"
+
+        return [
+            OtherPowerComponent(
+                id: "ane",
+                label: "ANE",
+                powerWatts: effectiveANEPowerWatts,
+                basis: aneBasis
+            ),
+            OtherPowerComponent(
+                id: "dram",
+                label: "内存",
+                powerWatts: dramPowerWatts,
+                basis: "IOReport 通道"
+            ),
+            OtherPowerComponent(
+                id: "media",
+                label: "媒体引擎",
+                powerWatts: mediaPowerWatts,
+                basis: "IOReport 通道"
+            ),
+            OtherPowerComponent(
+                id: "isp",
+                label: "图像 ISP",
+                powerWatts: ispPowerWatts,
+                basis: "IOReport 通道"
+            ),
+            OtherPowerComponent(
+                id: "fabric",
+                label: "芯片互联",
+                powerWatts: fabricPowerWatts,
+                basis: "IOReport 通道"
+            ),
+            OtherPowerComponent(
+                id: "pcie",
+                label: "PCIe 汇总",
+                powerWatts: pciePowerWatts,
+                basis: "IOReport 通道"
+            )
+        ]
+        .filter { $0.powerWatts > 0.02 && $0.powerWatts.isFinite }
+    }
+
+    /// Power left after subtracting directly readable secondary channels from
+    /// the residual branch. Direct channels are sampled asynchronously, so
+    /// their raw values remain untouched in the UI while this budget is
+    /// conservatively clamped to the residual total.
+    var estimatedOtherPowerBudgetWatts: Double {
+        let directTotal = readableOtherPowerComponents.reduce(0) {
+            $0 + $1.powerWatts
+        }
+        return max(0, effectiveOtherPowerWatts - directTotal)
+    }
+
+    /// Honest, activity-shaped allocation of the part of "other" for which no
+    /// independent watt channel exists. These are not invented sensors: each
+    /// row is marked as an estimate and names its proxy signal in `basis`.
+    ///
+    /// Four non-overlapping system buckets are always present. Up to two more
+    /// are added only when their corresponding direct channels are absent, so
+    /// the expanded card stays within 4...6 compact items.
+    var estimatedOtherPowerComponents: [OtherPowerComponent] {
+        let directIDs = Set(readableOtherPowerComponents.map(\.id))
+        let budget = estimatedOtherPowerBudgetWatts
+
+        // Saturating normalizations avoid model-specific TDP/RPM constants
+        // while still reacting smoothly to every two-second hardware sample.
+        let loadSignal = saturatingSignal(systemLoadWatts, halfScale: 18)
+        let memoryRate = Double(max(0, dramReadBytesPerSecond))
+            + Double(max(0, dramWriteBytesPerSecond))
+        let memorySignal = saturatingSignal(
+            memoryRate,
+            halfScale: 8_000_000_000
+        )
+        let cpuSignal = min(max(cpuUsagePercent / 100, 0), 1)
+        let reportedGPUActivity = administratorSampleIsFresh
+            && administratorGPUActivePercent >= 0
+            ? administratorGPUActivePercent
+            : gpuUsagePercent
+        let gpuSignal = reportedGPUActivity >= 0
+            ? min(max(reportedGPUActivity / 100, 0), 1)
+            : 0
+        let activitySignal = max(cpuSignal, gpuSignal)
+        let activeFanCount = [fanRPM, fan2RPM].filter { $0 > 0 }
+        let averageFanRPM = activeFanCount.isEmpty
+            ? 0
+            : Double(activeFanCount.reduce(0, +))
+                / Double(activeFanCount.count)
+        let fanSignal = saturatingSignal(averageFanRPM, halfScale: 2_500)
+
+        var seeds: [(id: String, label: String, basis: String, weight: Double)] = []
+
+        let memoryMissing = !directIDs.contains("dram")
+        let fabricMissing = !directIDs.contains("fabric")
+        if memoryMissing || fabricMissing {
+            let label: String
+            switch (memoryMissing, fabricMissing) {
+            case (true, true):
+                label = "内存与芯片互联"
+            case (true, false):
+                label = "内存活动"
+            case (false, true):
+                label = "芯片互联"
+            case (false, false):
+                label = ""
+            }
+            seeds.append((
+                id: "estimated-memory-fabric",
+                label: label,
+                basis: memoryMissing ? "内存带宽 + 整机活动" : "整机活动",
+                weight: 0.45 + 2.6 * memorySignal + 0.65 * loadSignal
+            ))
+        }
+
+        let mediaMissing = !directIDs.contains("media")
+        let ispMissing = !directIDs.contains("isp")
+        let pcieMissing = !directIDs.contains("pcie")
+        if mediaMissing || ispMissing || pcieMissing {
+            let engineMissing = mediaMissing || ispMissing
+            let label: String
+            switch (engineMissing, pcieMissing) {
+            case (true, true):
+                label = "媒体、存储与外设"
+            case (true, false):
+                label = mediaMissing && ispMissing
+                    ? "媒体与图像处理"
+                    : (mediaMissing ? "媒体引擎" : "图像处理")
+            case (false, true):
+                label = "存储与高速外设"
+            case (false, false):
+                label = ""
+            }
+            seeds.append((
+                id: "estimated-media-peripherals",
+                label: label,
+                basis: "芯片活跃 + 整机活动",
+                weight: 0.55 + 1.5 * activitySignal + 0.8 * loadSignal
+            ))
+        }
+
+        // macOS does not expose portable watt channels for these four groups.
+        // They never duplicate the CPU/GPU/display or the direct domains above.
+        seeds.append(contentsOf: [
+            (
+                id: "estimated-network",
+                label: "网络与无线",
+                basis: "整机活动代理",
+                weight: 0.65 + 0.45 * loadSignal
+            ),
+            (
+                id: "estimated-cooling",
+                label: "风扇与散热",
+                basis: averageFanRPM > 0 ? "风扇转速" : "散热基线",
+                weight: 0.22 + 2.0 * fanSignal
+            ),
+            (
+                id: "estimated-board-conversion",
+                label: "板级电源转换",
+                basis: "整机负载",
+                weight: 0.85 + 1.45 * loadSignal
+            ),
+            (
+                id: "estimated-controllers",
+                label: "主板控制器与传感器",
+                basis: "基础常驻负载",
+                weight: 1.0 + 0.2 * (1 - loadSignal)
+            )
+        ])
+
+        let totalWeight = seeds.reduce(0) { $0 + max(0, $1.weight) }
+        guard totalWeight > 0 else { return [] }
+
+        var allocated = 0.0
+        return seeds.enumerated().map { index, seed in
+            let power: Double
+            if index == seeds.index(before: seeds.endIndex) {
+                // Assign the final floating-point remainder to the last row so
+                // the estimate sum is exactly the bounded budget.
+                power = max(0, budget - allocated)
+            } else {
+                power = budget * max(0, seed.weight) / totalWeight
+                allocated += power
+            }
+            return OtherPowerComponent(
+                id: seed.id,
+                label: seed.label,
+                powerWatts: power,
+                basis: seed.basis
+            )
+        }
+    }
+
+    var estimatedOtherPowerTotalWatts: Double {
+        estimatedOtherPowerComponents.reduce(0) { $0 + $1.powerWatts }
+    }
+
+    private func saturatingSignal(
+        _ value: Double,
+        halfScale: Double
+    ) -> Double {
+        guard value.isFinite, value > 0, halfScale > 0 else { return 0 }
+        return min(max(value / (value + halfScale), 0), 1)
     }
 
     /// Best-effort CPU estimate used while the persistent privileged stream is

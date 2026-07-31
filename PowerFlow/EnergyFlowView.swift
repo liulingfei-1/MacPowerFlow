@@ -175,7 +175,7 @@ struct EnergyFlowView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("其他功耗分项")
                             .font(.system(size: 12, weight: .semibold))
-                        Text("展开查看 ANE、内存与外围负载")
+                        Text("展开查看实测与动态估算")
                             .font(.system(size: 9.5))
                             .foregroundStyle(secondary)
                     }
@@ -201,15 +201,11 @@ struct EnergyFlowView: View {
                     .padding(.horizontal, 12)
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("可读取的其他分项")
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(secondary)
+                    if !model.readableOtherPowerComponents.isEmpty {
+                        Text("可读取的功耗通道")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(secondary)
 
-                    if availableOtherDetails.isEmpty {
-                        Text("当前机型暂未提供可独立读取的其他功耗分项。")
-                            .font(.system(size: 10))
-                            .foregroundStyle(Color.white.opacity(0.56))
-                    } else {
                         LazyVGrid(
                             columns: [
                                 GridItem(
@@ -219,32 +215,62 @@ struct EnergyFlowView: View {
                             ],
                             spacing: 6
                         ) {
-                            ForEach(availableOtherDetails) { item in
-                                miniMetric(item.label, item.value)
+                            ForEach(model.readableOtherPowerComponents) { item in
+                                miniMetric(
+                                    item.label,
+                                    watts(item.powerWatts),
+                                    detail: item.basis
+                                )
                             }
+                        }
+                    }
+
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(model.readableOtherPowerComponents.isEmpty
+                            ? "其他功耗动态估算"
+                            : "未覆盖剩余量估算")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(secondary)
+                        Spacer()
+                        Text(watts(
+                            model.estimatedOtherPowerTotalWatts,
+                            allowZero: true,
+                            approximate: true
+                        ))
+                            .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(Color.white.opacity(0.62))
+                    }
+
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.flexible(), spacing: 6),
+                            GridItem(.flexible(), spacing: 6)
+                        ],
+                        spacing: 6
+                    ) {
+                        ForEach(model.estimatedOtherPowerComponents) { item in
+                            miniMetric(
+                                item.label,
+                                watts(
+                                    item.powerWatts,
+                                    allowZero: true,
+                                    approximate: true
+                                ),
+                                detail: item.basis
+                            )
                         }
                     }
 
                     Text(otherModelNote)
                         .font(.system(size: 9.5))
                         .foregroundStyle(Color.white.opacity(0.52))
-
-                    Text("其他活动线索")
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(secondary)
-                        .padding(.top, 1)
-
-                    HStack(spacing: 6) {
-                        miniMetric("风扇", fanSummary)
-                        miniMetric("内存读取", bandwidth(model.dramReadBytesPerSecond))
-                        miniMetric("内存写入", bandwidth(model.dramWriteBytesPerSecond))
-                    }
+                        .fixedSize(horizontal: false, vertical: true)
 
                     Text(
-                        "“其他”是整机负载扣除主图已展示项目后的剩余量，进一步包含 "
-                            + "ANE、内存、媒体引擎、SSD、网络、雷雳/USB 控制器、"
-                            + "风扇、电源转换及采样时差。可可靠读取的项目列在上方；"
-                            + "没有通用瓦数的项目不会伪装成实测。"
+                        "“其他”是整机负载扣除 CPU、GPU 和显示后的剩余量。"
+                            + "上方“可读取”保留原始通道；带 ≈ 的项目仅把未覆盖剩余量按活动信号分配，"
+                            + "估算合计始终不超过“其他”，不代表 macOS 提供了这些独立传感器。"
                     )
                         .font(.system(size: 10))
                         .foregroundStyle(Color.white.opacity(0.56))
@@ -524,27 +550,44 @@ struct EnergyFlowView: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func miniMetric(_ label: String, _ value: String) -> some View {
+    private func miniMetric(
+        _ label: String,
+        _ value: String,
+        detail: String? = nil
+    ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
                 .font(.system(size: 8.5, weight: .medium))
                 .foregroundStyle(Color.white.opacity(0.45))
                 .lineLimit(1)
+                .minimumScaleFactor(0.72)
             Text(value)
                 .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
+
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 7.5, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.35))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.68)
+            }
         }
         .padding(.horizontal, 8)
-        .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+        .frame(
+            maxWidth: .infinity,
+            minHeight: detail == nil ? 40 : 50,
+            alignment: .leading
+        )
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(Color.white.opacity(0.045))
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
-        .accessibilityValue(value)
+        .accessibilityValue([value, detail].compactMap { $0 }.joined(separator: "，"))
     }
 
     private func cardHeader(_ title: String, symbol: String) -> some View {
@@ -743,34 +786,24 @@ struct EnergyFlowView: View {
         return "—"
     }
 
-    private var availableOtherDetails: [TelemetryDatum] {
-        [
-            TelemetryDatum(label: "ANE", power: model.effectiveANEPowerWatts),
-            TelemetryDatum(label: "内存", power: model.dramPowerWatts),
-            TelemetryDatum(label: "媒体引擎", power: model.mediaPowerWatts),
-            TelemetryDatum(label: "图像 ISP", power: model.ispPowerWatts),
-            TelemetryDatum(label: "芯片互联", power: model.fabricPowerWatts),
-            TelemetryDatum(label: "PCIe 汇总", power: model.pciePowerWatts)
-        ]
-        .filter { $0.power > 0.02 }
-        .map {
-            TelemetryDatum(
-                label: $0.label,
-                value: watts($0.power)
-            )
-        }
-    }
-
     private var otherModelNote: String {
-        if model.administratorSamplingState == .active {
-            guard model.administratorSampleIsFresh else {
-                return "增强采样仍在运行，但最近样本暂不可用；这里继续展示普通传感器可可靠读取的其他通道。"
-            }
-            return model.administratorANEHasValue
-                ? "ANE 采用当前管理员增强样本；其余项目来自普通传感器。不同来源的分项仅供参照，不能强行相加。"
-                : "当前增强样本没有独立 ANE 字段；这里仅列普通传感器可可靠读取的其他通道。"
+        let readRate = max(0, model.dramReadBytesPerSecond)
+        let writeRate = max(0, model.dramWriteBytesPerSecond)
+        let memoryRate = readRate > Int64.max - writeRate
+            ? Int64.max
+            : readRate + writeRate
+        var signals = ["整机负载", "芯片活跃度"]
+        if memoryRate > 0 {
+            signals.append("内存带宽 \(bandwidth(memoryRate))")
         }
-        return "这里只列主能量流未单独展示、且当前机型可可靠读取的其他通道；不同来源的分项仅供参照，不能强行相加。"
+        if model.fanRPM > 0 || model.fan2RPM > 0 {
+            signals.append("风扇 \(fanSummary)")
+        }
+        let timingNote = model.readableOtherPowerComponents.isEmpty
+            ? ""
+            : "可读取通道存在采样时差，保留原值而不强行缩放。"
+        return "估算依据：" + signals.joined(separator: "、")
+            + "。每次采样都会重新分配。" + timingNote
     }
 
     private var lastUpdatedText: String {
@@ -841,26 +874,6 @@ struct EnergyFlowView: View {
             return String(format: "%.1f V  ·  %+.2f A", voltage, current)
         }
         return String(format: "%.1f V", voltage)
-    }
-}
-
-private struct TelemetryDatum: Identifiable {
-    let label: String
-    let value: String
-    let power: Double
-
-    var id: String { label }
-
-    init(label: String, value: String) {
-        self.label = label
-        self.value = value
-        power = 0
-    }
-
-    init(label: String, power: Double) {
-        self.label = label
-        value = ""
-        self.power = power
     }
 }
 
