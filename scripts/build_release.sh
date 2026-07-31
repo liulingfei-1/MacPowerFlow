@@ -7,12 +7,12 @@ project_dir="$(cd -- "${script_dir}/.." && pwd -P)"
 project_file="${project_dir}/MacPowerFlow.xcodeproj"
 scheme="MacPowerFlow"
 product_name="MacPowerFlow.app"
-archive_name="MacPowerFlow-1.4.1.zip"
+archive_name="MacPowerFlow-1.5.0.zip"
 dist_dir="${project_dir}/dist"
 backup_dir="${project_dir}/.build/previous-releases"
 output_archive="${dist_dir}/${archive_name}"
 
-for command_name in xcodebuild codesign ditto xattr; do
+for command_name in git tar xcodebuild codesign ditto xattr; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
         echo "错误：找不到 ${command_name}，请安装并选择完整的 Xcode。" >&2
         exit 1
@@ -54,11 +54,27 @@ trap cleanup EXIT
 
 echo "正在把构建所需源码暂存到独立目录…"
 mkdir -p "${source_root}"
-for source_item in MacPowerFlow.xcodeproj PowerFlow Shared Helper Installer; do
-    ditto \
-        "${project_dir}/${source_item}" \
-        "${source_root}/${source_item}"
-done
+source_items=(MacPowerFlow.xcodeproj PowerFlow Shared Helper Installer)
+
+# Documents may be backed by File Provider and can contain evicted, dataless
+# copies of otherwise unchanged tracked files. Stage the committed baseline
+# directly from Git's object database, then apply the current tracked diff.
+# This keeps local release builds deterministic without blocking on iCloud.
+git -C "${project_dir}" archive --format=tar HEAD -- "${source_items[@]}" \
+    | tar -xf - -C "${source_root}"
+git -C "${project_dir}" diff --binary HEAD -- "${source_items[@]}" \
+    | git -C "${source_root}" apply --binary --whitespace=nowarn
+
+# Include any intentional, non-ignored new source file in the working tree.
+while IFS= read -r -d '' untracked_source; do
+    mkdir -p "${source_root}/$(dirname -- "${untracked_source}")"
+    ditto --noextattr --noqtn \
+        "${project_dir}/${untracked_source}" \
+        "${source_root}/${untracked_source}"
+done < <(
+    git -C "${project_dir}" ls-files \
+        --others --exclude-standard -z -- "${source_items[@]}"
+)
 
 echo "正在构建 MacPowerFlow Release（arm64）…"
 xcodebuild \

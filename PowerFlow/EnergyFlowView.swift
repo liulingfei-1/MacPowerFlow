@@ -87,6 +87,12 @@ struct EnergyFlowView: View {
             let progress = model.batteryPresent && model.batteryLevel >= 0
                 ? CGFloat(min(max(model.batteryLevel, 0), 100)) / 100
                 : 1
+            let railStart = model.isCharging
+                ? accent.opacity(0.74)
+                : Color.white.opacity(0.24)
+            let railEnd = model.isCharging
+                ? accent.opacity(0.96)
+                : Color.white.opacity(0.42)
 
             ZStack(alignment: .leading) {
                 Capsule()
@@ -99,10 +105,7 @@ struct EnergyFlowView: View {
                 Capsule()
                     .fill(
                         LinearGradient(
-                            colors: [
-                                accent.opacity(model.isOnAC ? 0.74 : 0.58),
-                                accent.opacity(0.96)
-                            ],
+                            colors: [railStart, railEnd],
                             startPoint: .leading,
                             endPoint: .trailing
                         )
@@ -146,13 +149,12 @@ struct EnergyFlowView: View {
                 : model.batteryFlowWatts,
             batteryPower: model.batteryFlowWatts,
             systemPower: model.systemLoadWatts,
-            systemPowerIsEstimated: model.systemLoadIsEstimated,
             cpuPower: model.effectiveCPUPowerWatts,
             gpuPower: model.effectiveGPUPowerWatts,
-            displayPower: model.displayPowerWatts,
+            displayPower: model.effectiveDisplayPowerWatts,
             unclassifiedPower: model.effectiveOtherPowerWatts
         )
-        .frame(height: 220)
+        .frame(height: 228)
     }
 
     private var componentDetailCard: some View {
@@ -175,14 +177,14 @@ struct EnergyFlowView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("其他功耗分项")
                             .font(.system(size: 12, weight: .semibold))
-                        Text("展开查看实测与动态估算")
+                        Text("当前功耗分配")
                             .font(.system(size: 9.5))
                             .foregroundStyle(secondary)
                     }
 
                     Spacer()
 
-                    Text(watts(model.effectiveOtherPowerWatts, approximate: true))
+                    Text(watts(model.effectiveOtherPowerWatts))
                         .font(.system(size: 14, weight: .bold, design: .rounded))
                         .monospacedDigit()
 
@@ -201,42 +203,12 @@ struct EnergyFlowView: View {
                     .padding(.horizontal, 12)
 
                 VStack(alignment: .leading, spacing: 10) {
-                    if !model.readableOtherPowerComponents.isEmpty {
-                        Text("可读取的功耗通道")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundStyle(secondary)
-
-                        LazyVGrid(
-                            columns: [
-                                GridItem(
-                                    .adaptive(minimum: 78, maximum: 120),
-                                    spacing: 6
-                                )
-                            ],
-                            spacing: 6
-                        ) {
-                            ForEach(model.readableOtherPowerComponents) { item in
-                                miniMetric(
-                                    item.label,
-                                    watts(item.powerWatts),
-                                    detail: item.basis
-                                )
-                            }
-                        }
-                    }
-
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(model.readableOtherPowerComponents.isEmpty
-                            ? "其他功耗动态估算"
-                            : "未覆盖剩余量估算")
+                        Text("当前分配")
                             .font(.system(size: 9.5, weight: .semibold))
                             .foregroundStyle(secondary)
                         Spacer()
-                        Text(watts(
-                            model.estimatedOtherPowerTotalWatts,
-                            allowZero: true,
-                            approximate: true
-                        ))
+                        Text(watts(model.effectiveOtherPowerWatts, allowZero: true))
                             .font(.system(size: 9.5, weight: .semibold, design: .rounded))
                             .monospacedDigit()
                             .foregroundStyle(Color.white.opacity(0.62))
@@ -249,16 +221,20 @@ struct EnergyFlowView: View {
                         ],
                         spacing: 6
                     ) {
+                        ForEach(model.readableOtherPowerComponents) { item in
+                            miniMetric(
+                                item.label,
+                                watts(item.powerWatts, allowZero: true)
+                            )
+                            .help(item.basis)
+                        }
+
                         ForEach(model.estimatedOtherPowerComponents) { item in
                             miniMetric(
                                 item.label,
-                                watts(
-                                    item.powerWatts,
-                                    allowZero: true,
-                                    approximate: true
-                                ),
-                                detail: item.basis
+                                watts(item.powerWatts, allowZero: true)
                             )
+                            .help(item.basis)
                         }
                     }
 
@@ -268,9 +244,8 @@ struct EnergyFlowView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     Text(
-                        "“其他”是整机负载扣除 CPU、GPU 和显示后的剩余量。"
-                            + "上方“可读取”保留原始通道；带 ≈ 的项目仅把未覆盖剩余量按活动信号分配，"
-                            + "估算合计始终不超过“其他”，不代表 macOS 提供了这些独立传感器。"
+                        "“其他”是整机负载扣除 CPU、GPU 与显示后的剩余功耗；"
+                            + "分项会随系统活动及可用传感器同步变化。"
                     )
                         .font(.system(size: 10))
                         .foregroundStyle(Color.white.opacity(0.56))
@@ -349,10 +324,7 @@ struct EnergyFlowView: View {
             metricRow(
                 "整机负载",
                 symbol: "laptopcomputer",
-                value: watts(
-                    model.systemLoadWatts,
-                    approximate: model.systemLoadIsEstimated
-                ),
+                value: watts(model.systemLoadWatts),
                 detail: model.lowPowerModeEnabled ? "低电量已开" : "低电量已关"
             )
 
@@ -711,7 +683,7 @@ struct EnergyFlowView: View {
     private var administratorStatusText: String {
         switch model.administratorSamplingState {
         case .inactive:
-            return "普通估算"
+            return "标准采样"
         case .authorizing:
             return "连接服务"
         case .starting:
@@ -728,7 +700,7 @@ struct EnergyFlowView: View {
     private var administratorStatusHelp: String {
         switch model.administratorSamplingState {
         case .inactive:
-            return "增强服务尚未启动，当前使用普通估算"
+            return "增强服务尚未启动，当前使用标准采样"
         case .authorizing:
             return "正在连接增强服务；首次使用时只需批准安装一次"
         case .starting:
@@ -768,12 +740,12 @@ struct EnergyFlowView: View {
 
     private var healthText: String {
         guard model.healthPercent > 0 else { return "—" }
-        return "\(model.healthIsEstimated ? "≈" : "")\(model.healthPercent)%"
+        return "\(model.healthPercent)%"
     }
 
     private var capacityText: String {
         guard model.fullCapacityMAh > 0 else { return "—" }
-        return "\(model.capacityIsEstimated ? "≈" : "")\(model.currentCapacityMAh) / \(model.fullCapacityMAh) mAh"
+        return "\(model.currentCapacityMAh) / \(model.fullCapacityMAh) mAh"
     }
 
     private var fanSummary: String {
@@ -799,11 +771,8 @@ struct EnergyFlowView: View {
         if model.fanRPM > 0 || model.fan2RPM > 0 {
             signals.append("风扇 \(fanSummary)")
         }
-        let timingNote = model.readableOtherPowerComponents.isEmpty
-            ? ""
-            : "可读取通道存在采样时差，保留原值而不强行缩放。"
-        return "估算依据：" + signals.joined(separator: "、")
-            + "。每次采样都会重新分配。" + timingNote
+        return "跟随" + signals.joined(separator: "、")
+            + "同步更新，每次采样都会重新分配。"
     }
 
     private var lastUpdatedText: String {
@@ -815,14 +784,13 @@ struct EnergyFlowView: View {
 
     private func watts(
         _ value: Double,
-        allowZero: Bool = false,
-        approximate: Bool = false
+        allowZero: Bool = false
     ) -> String {
         guard value > 0.02 || allowZero else { return "—" }
         let number = value >= 100
             ? String(format: "%.0f", value)
             : String(format: "%.1f", max(0, value))
-        return "\(approximate ? "≈" : "")\(number) W"
+        return "\(number) W"
     }
 
     private func administratorPercent(_ value: Double) -> String {
@@ -891,7 +859,6 @@ private struct FlowBranchDefinition {
     let symbol: String
     let iconSize: CGFloat
     let power: Double
-    let approximate: Bool
     let emphasized: Bool
 }
 
@@ -970,7 +937,6 @@ private struct SculptedPowerFlow: View {
     let sourcePower: Double
     let batteryPower: Double
     let systemPower: Double
-    let systemPowerIsEstimated: Bool
     let cpuPower: Double
     let gpuPower: Double
     let displayPower: Double
@@ -981,64 +947,47 @@ private struct SculptedPowerFlow: View {
     private let stroke = Color.white.opacity(0.13)
     private let text = Color.white.opacity(0.88)
     private let quiet = Color.white.opacity(0.60)
+    private let chargingAccent = Color(red: 0.10, green: 0.78, blue: 0.38)
 
     var body: some View {
         GeometryReader { proxy in
             let width = proxy.size.width
-            let capWidth: CGFloat = 46
+            let canvasHeight = proxy.size.height
+            let secondaryNodeWidth: CGFloat = 124
+            let secondaryNodeHeight: CGFloat = 32
+            let sourceBlockWidth: CGFloat = 46
+            let capWidth: CGFloat = 92
             let capX = width - capWidth
-            let branchEnd = capX - 6
-            let systemX = width * 0.45
-            let systemWidth: CGFloat = 58
-            let branchStart = systemX + systemWidth + 6
-            let inputX: CGFloat = 54
-            let inputWidth = systemX - inputX - 6
-            let secondaryLinkStartX: CGFloat = 52
-            let secondaryLinkEndX = inputX + inputWidth
+            let systemX = width * 0.42
+            let systemWidth: CGFloat = 64
+            let branchStart = systemX + systemWidth - 1
+            let branchEnd = capX + 1
+            let inputX = sourceBlockWidth + 6
+            let inputWidth = systemX - inputX + 1
+            let systemTop: CGFloat = 66
+            let secondaryLinkStartX = secondaryNodeWidth - 2
+            let secondaryLinkEndX = systemX + 1
             let secondaryLinkHeight = secondarySourceLinkHeight()
-            let secondaryLinkRightCenter =
-                66 + secondaryLinkHeight / 2
             let secondaryLink = FlowRibbonShape(
                 startX: secondaryLinkStartX,
                 endX: secondaryLinkEndX,
-                leftTop: 26 - secondaryLinkHeight / 2,
-                leftBottom: 26 + secondaryLinkHeight / 2,
-                rightTop:
-                    secondaryLinkRightCenter - secondaryLinkHeight / 2,
-                rightBottom:
-                    secondaryLinkRightCenter + secondaryLinkHeight / 2
+                leftTop: 22 - secondaryLinkHeight / 2,
+                leftBottom: 22 + secondaryLinkHeight / 2,
+                rightTop: systemTop,
+                rightBottom: systemTop + secondaryLinkHeight
             )
-            let layouts = branchLayouts()
-            let labelProgress: CGFloat = 0.70
-            let labelWidth = min(
-                64,
-                max(48, branchEnd - branchStart - 24)
-            )
-            let labelHalfSpan = min(
-                0.26,
-                labelWidth / max(1, 2 * (branchEnd - branchStart)) + 0.03
-            )
-            let labelX = branchStart
-                + (branchEnd - branchStart)
-                    * horizontalCurveProgress(labelProgress)
+            let layouts = branchLayouts(canvasHeight: canvasHeight)
 
             ZStack {
-                Canvas { context, _ in
-                    drawStaticBlocks(
-                        context: &context,
-                        inputX: inputX,
-                        inputWidth: inputWidth,
-                        systemX: systemX,
-                        systemWidth: systemWidth
-                    )
-                }
-                .accessibilityHidden(true)
-
                 secondaryLink
                     .fill(fill)
                     .overlay {
                         secondaryLink.stroke(stroke, lineWidth: 1)
                     }
+                    .animation(
+                        .easeInOut(duration: 0.35),
+                        value: safePower(batteryPower)
+                    )
 
                 ForEach(layouts) { branch in
                     let ribbon = FlowRibbonShape(
@@ -1059,7 +1008,23 @@ private struct SculptedPowerFlow: View {
                         .overlay {
                             ribbon.stroke(stroke, lineWidth: 1)
                         }
+                        .animation(
+                            .easeInOut(duration: 0.35),
+                            value: branch.definition.power
+                        )
                 }
+
+                Canvas { context, _ in
+                    drawStaticBlocks(
+                        context: &context,
+                        inputX: inputX,
+                        inputWidth: inputWidth,
+                        systemX: systemX,
+                        systemWidth: systemWidth,
+                        canvasHeight: canvasHeight
+                    )
+                }
+                .accessibilityHidden(true)
 
                 ForEach(layouts) { branch in
                     RoundedRectangle(
@@ -1069,7 +1034,11 @@ private struct SculptedPowerFlow: View {
                         ),
                         style: .continuous
                     )
-                    .fill(fill)
+                    .fill(
+                        branch.definition.emphasized
+                            ? strongFill
+                            : fill
+                    )
                     .overlay {
                         RoundedRectangle(
                             cornerRadius: min(
@@ -1087,88 +1056,38 @@ private struct SculptedPowerFlow: View {
                     )
                 }
 
-                sourceLabels(inputX: inputX, inputWidth: inputWidth)
-                secondarySourceLabel(
-                    ribbon: secondaryLink,
-                    startX: secondaryLinkStartX,
-                    endX: secondaryLinkEndX,
-                    leftCenter: 26,
-                    rightCenter: secondaryLinkRightCenter,
-                    availableHeight: max(8, secondaryLinkHeight - 4),
-                    canvasWidth: width,
-                    canvasHeight: proxy.size.height
+                secondarySourceNode(
+                    width: secondaryNodeWidth,
+                    height: secondaryNodeHeight
                 )
-                systemLabel(x: systemX + systemWidth / 2)
+                .position(
+                    x: secondaryNodeWidth / 2,
+                    y: 22
+                )
+
+                sourceLabels(
+                    inputX: inputX,
+                    inputWidth: inputWidth,
+                    canvasHeight: canvasHeight
+                )
+                systemLabel(
+                    x: systemX + systemWidth / 2,
+                    width: systemWidth - 10,
+                    canvasHeight: canvasHeight
+                )
 
                 ForEach(layouts) { branch in
-                    let centerBounds = branch.bounds(at: labelProgress)
-                    let leadingBounds = branch.bounds(
-                        at: max(0, labelProgress - labelHalfSpan)
-                    )
-                    let trailingBounds = branch.bounds(
-                        at: min(1, labelProgress + labelHalfSpan)
-                    )
-                    let safeLabelHeight = max(
-                        7,
-                        min(
-                            centerBounds.height,
-                            leadingBounds.height,
-                            trailingBounds.height
-                        ) - 5
-                    )
-                    let ribbon = FlowRibbonShape(
-                        startX: branchStart,
-                        endX: branchEnd,
-                        leftTop: branch.left.top,
-                        leftBottom: branch.left.bottom,
-                        rightTop: branch.right.top,
-                        rightBottom: branch.right.bottom
-                    )
-
-                    branchLabel(
+                    branchDestinationLabel(
                         branch.definition,
-                        availableHeight: safeLabelHeight
+                        width: capWidth,
+                        height: branch.right.height
                     )
-                    .frame(
-                        width: labelWidth,
-                        height: safeLabelHeight
+                    .position(
+                        x: capX + capWidth / 2,
+                        y: branch.right.center
                     )
-                    .clipped()
-                    .position(x: labelX, y: centerBounds.center)
-                    .frame(
-                        width: width,
-                        height: proxy.size.height,
-                        alignment: .topLeading
-                    )
-                    // A rectangular clip cannot follow a branch that widens
-                    // or narrows while live values animate. The matching
-                    // ribbon mask guarantees that glyphs never cross the
-                    // actual curved border.
-                    .mask(ribbon)
-                }
-
-                ForEach(layouts) { branch in
-                    Image(systemName: branch.definition.symbol)
-                        .font(
-                            .system(
-                                size: min(
-                                    branch.definition.iconSize,
-                                    max(8, branch.right.height * 0.42)
-                                ),
-                                weight: .medium
-                            )
-                        )
-                        .foregroundStyle(quiet)
-                        .position(
-                            x: capX + capWidth / 2,
-                            y: branch.right.center
-                        )
                 }
             }
-            .animation(
-                .easeInOut(duration: 0.35),
-                value: branchAnimationKey
-            )
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("当前能量流")
@@ -1180,37 +1099,34 @@ private struct SculptedPowerFlow: View {
         inputX: CGFloat,
         inputWidth: CGFloat,
         systemX: CGFloat,
-        systemWidth: CGFloat
+        systemWidth: CGFloat,
+        canvasHeight: CGFloat
     ) {
+        let bottom = canvasHeight - 4
+
         drawRounded(
-            CGRect(x: 0, y: 54, width: 48, height: 160),
+            CGRect(x: 0, y: 52, width: 46, height: bottom - 52),
             radius: 17,
             fill: strongFill,
             in: &context
         )
 
         var inputPath = Path()
-        inputPath.move(to: CGPoint(x: inputX, y: 54))
+        inputPath.move(to: CGPoint(x: inputX, y: 52))
         inputPath.addCurve(
-            to: CGPoint(x: inputX + inputWidth, y: 68),
-            control1: CGPoint(x: inputX + inputWidth * 0.46, y: 54),
-            control2: CGPoint(x: inputX + inputWidth * 0.62, y: 68)
+            to: CGPoint(x: inputX + inputWidth, y: 66),
+            control1: CGPoint(x: inputX + inputWidth * 0.46, y: 52),
+            control2: CGPoint(x: inputX + inputWidth * 0.62, y: 66)
         )
-        inputPath.addLine(to: CGPoint(x: inputX + inputWidth, y: 214))
-        inputPath.addLine(to: CGPoint(x: inputX, y: 214))
+        inputPath.addLine(to: CGPoint(x: inputX + inputWidth, y: bottom))
+        inputPath.addLine(to: CGPoint(x: inputX, y: bottom))
         inputPath.closeSubpath()
         fillAndStroke(inputPath, fill: strongFill, in: &context)
 
         drawRounded(
-            CGRect(x: systemX, y: 68, width: systemWidth, height: 146),
+            CGRect(x: systemX, y: 66, width: systemWidth, height: bottom - 66),
             radius: 13,
             fill: strongFill,
-            in: &context
-        )
-        drawRounded(
-            CGRect(x: 0, y: 13, width: 48, height: 26),
-            radius: 13,
-            fill: fill,
             in: &context
         )
     }
@@ -1234,12 +1150,18 @@ private struct SculptedPowerFlow: View {
         context.stroke(path, with: .color(stroke), lineWidth: 1)
     }
 
-    private func sourceLabels(inputX: CGFloat, inputWidth: CGFloat) -> some View {
-        ZStack {
+    private func sourceLabels(
+        inputX: CGFloat,
+        inputWidth: CGFloat,
+        canvasHeight: CGFloat
+    ) -> some View {
+        let centerY = (52 + canvasHeight - 4) / 2
+
+        return ZStack {
             Image(systemName: isOnAC ? "powerplug.fill" : "battery.100")
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(quiet)
-                .position(x: 24, y: 139)
+                .position(x: 23, y: centerY)
 
             VStack(spacing: 4) {
                 Text(isOnAC ? "适配器" : "电池")
@@ -1249,64 +1171,49 @@ private struct SculptedPowerFlow: View {
                     .font(.system(size: 16, weight: .bold, design: .rounded))
                     .foregroundStyle(text)
                     .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.58)
+                    .allowsTightening(true)
             }
-            .position(x: inputX + inputWidth / 2, y: 142)
-
-            Image(
-                systemName: isOnAC
-                    ? (batteryPresent ? batterySymbol : "minus")
-                    : "powerplug.fill"
-            )
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(quiet)
-                .position(x: 24, y: 26)
+            .frame(width: max(42, inputWidth - 14))
+            .position(x: inputX + inputWidth / 2, y: centerY)
         }
     }
 
-    private func secondarySourceLabel(
-        ribbon: FlowRibbonShape,
-        startX: CGFloat,
-        endX: CGFloat,
-        leftCenter: CGFloat,
-        rightCenter: CGFloat,
-        availableHeight: CGFloat,
-        canvasWidth: CGFloat,
-        canvasHeight: CGFloat
+    private func secondarySourceNode(
+        width: CGFloat,
+        height: CGFloat
     ) -> some View {
-        let progress: CGFloat = 0.43
-        let curveProgress = horizontalCurveProgress(progress)
-        let verticalProgress = progress * progress * (3 - 2 * progress)
-        let centerX = startX + (endX - startX) * curveProgress
-        let centerY =
-            leftCenter + (rightCenter - leftCenter) * verticalProgress
-        let labelWidth = min(54, max(38, (endX - startX) * 0.43))
-        let fontSize = min(9, max(6.8, availableHeight * 0.68))
+        let charging = isOnAC
+            && batteryPresent
+            && batteryDirection == .charging
 
-        return Text(secondarySourceText)
-            .font(
-                .system(
-                    size: fontSize,
-                    weight: .semibold,
-                    design: .rounded
-                )
-            )
-            .monospacedDigit()
-            .foregroundStyle(quiet)
-            .lineLimit(1)
-            .minimumScaleFactor(0.62)
-            .allowsTightening(true)
-            .frame(width: labelWidth, height: availableHeight)
-            .clipped()
-            .position(x: centerX, y: centerY)
-            .frame(
-                width: canvasWidth,
-                height: canvasHeight,
-                alignment: .topLeading
-            )
-            // The secondary source can become very thin at zero battery
-            // flow. Masking with the live ribbon keeps every glyph inside its
-            // curved energy path through value changes and animations.
-            .mask(ribbon)
+        return HStack(spacing: 6) {
+            Image(systemName: secondarySourceSymbol)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(charging ? chargingAccent : quiet)
+
+            Text(secondarySourceText)
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(text)
+                .lineLimit(1)
+                .minimumScaleFactor(0.64)
+                .allowsTightening(true)
+        }
+        .padding(.horizontal, 9)
+        .frame(width: width, height: height, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: height / 2, style: .continuous)
+                .fill(charging ? chargingAccent.opacity(0.13) : fill)
+                .overlay {
+                    RoundedRectangle(cornerRadius: height / 2, style: .continuous)
+                        .stroke(
+                            charging ? chargingAccent.opacity(0.42) : stroke,
+                            lineWidth: 1
+                        )
+                }
+        )
     }
 
     private func secondarySourceLinkHeight() -> CGFloat {
@@ -1318,46 +1225,58 @@ private struct SculptedPowerFlow: View {
             safePower(systemPower)
         )
         let ratio = min(1, secondaryPower / referencePower)
-        return 14 + 10 * CGFloat(pow(ratio, 0.55))
+        return 10 + 10 * CGFloat(pow(ratio, 0.55))
     }
 
     private var secondarySourceText: String {
-        guard isOnAC else { return "未接电源" }
-        guard batteryPresent else { return "无电池" }
+        guard isOnAC else { return "未接适配器" }
+        guard batteryPresent else { return "无内置电池" }
 
-        let value = safePower(batteryPower)
-        let number = value >= 100
-            ? String(format: "%.0f", value)
-            : String(format: "%.1f", value)
-        return "\(number)W"
+        let state: String
+        switch batteryDirection {
+        case .charging:
+            state = "充电"
+        case .supplying:
+            state = "放电"
+        case .idle, .unknown, .unavailable:
+            state = "待机"
+        }
+        return "\(state)  \(compactWatt(batteryPower, allowZero: true))"
     }
 
-    private func systemLabel(x: CGFloat) -> some View {
-        VStack(spacing: 5) {
+    private var secondarySourceSymbol: String {
+        guard isOnAC else { return "powerplug" }
+        guard batteryPresent else { return "minus" }
+        return batterySymbol
+    }
+
+    private func systemLabel(
+        x: CGFloat,
+        width: CGFloat,
+        canvasHeight: CGFloat
+    ) -> some View {
+        let centerY = (66 + canvasHeight - 4) / 2
+
+        return VStack(spacing: 5) {
             Image(systemName: "laptopcomputer")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(quiet)
-            Text(watt(systemPower, approximate: systemPowerIsEstimated))
+            Text(compactWatt(systemPower))
                 .font(.system(size: 14.5, weight: .bold, design: .rounded))
                 .foregroundStyle(text)
                 .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.56)
+                .allowsTightening(true)
             Text("系统")
                 .font(.system(size: 8.5, weight: .medium))
                 .foregroundStyle(quiet)
         }
-        .position(x: x, y: 143)
+        .frame(width: width)
+        .position(x: x, y: centerY)
     }
 
-    private var branchAnimationKey: [Double] {
-        [
-            safePower(cpuPower),
-            safePower(gpuPower),
-            safePower(displayPower),
-            safePower(unclassifiedPower)
-        ]
-    }
-
-    private func branchLayouts() -> [FlowBranchLayout] {
+    private func branchLayouts(canvasHeight: CGFloat) -> [FlowBranchLayout] {
         let definitions = [
             FlowBranchDefinition(
                 id: 0,
@@ -1365,7 +1284,6 @@ private struct SculptedPowerFlow: View {
                 symbol: "cpu",
                 iconSize: 13,
                 power: safePower(cpuPower),
-                approximate: true,
                 emphasized: true
             ),
             FlowBranchDefinition(
@@ -1374,7 +1292,6 @@ private struct SculptedPowerFlow: View {
                 symbol: "rectangle.3.group",
                 iconSize: 12,
                 power: safePower(gpuPower),
-                approximate: true,
                 emphasized: true
             ),
             FlowBranchDefinition(
@@ -1383,7 +1300,6 @@ private struct SculptedPowerFlow: View {
                 symbol: "display",
                 iconSize: 10,
                 power: safePower(displayPower),
-                approximate: false,
                 emphasized: false
             ),
             FlowBranchDefinition(
@@ -1392,7 +1308,6 @@ private struct SculptedPowerFlow: View {
                 symbol: "ellipsis",
                 iconSize: 13,
                 power: safePower(unclassifiedPower),
-                approximate: true,
                 emphasized: false
             )
         ]
@@ -1402,16 +1317,16 @@ private struct SculptedPowerFlow: View {
         let leftBands = bandBounds(
             weights: weights,
             top: 70,
-            bottom: 210,
-            gap: 4,
-            preferredMinimum: 14
+            bottom: canvasHeight - 10,
+            gap: 5,
+            preferredMinimum: 18
         )
         let rightBands = bandBounds(
-            weights: weights,
-            top: 10,
-            bottom: 216,
+            weights: Array(repeating: 1, count: definitions.count),
+            top: 2,
+            bottom: canvasHeight - 2,
             gap: 5,
-            preferredMinimum: 20
+            preferredMinimum: 42
         )
 
         return definitions.indices.map { index in
@@ -1457,74 +1372,36 @@ private struct SculptedPowerFlow: View {
         }
     }
 
-    @ViewBuilder
-    private func branchLabel(
+    private func branchDestinationLabel(
         _ branch: FlowBranchDefinition,
-        availableHeight: CGFloat
+        width: CGFloat,
+        height: CGFloat
     ) -> some View {
-        if availableHeight >= 32 {
-            VStack(spacing: 1) {
-                Text(
-                    watt(
-                        branch.power,
-                        approximate: branch.approximate
-                    )
-                )
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
+        HStack(spacing: 7) {
+            Image(systemName: branch.symbol)
+                .font(.system(size: branch.iconSize, weight: .medium))
+                .foregroundStyle(quiet)
+                .frame(width: 16)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(branch.label)
+                    .font(.system(size: 8.5, weight: .medium))
+                    .foregroundStyle(quiet)
+                    .lineLimit(1)
+
+                Text(compactWatt(branch.power))
+                    .font(.system(size: 11.5, weight: .bold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(text)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-
-                Text(branch.label)
-                    .font(.system(size: 7.5, weight: .medium))
-                    .foregroundStyle(quiet)
-                    .lineLimit(1)
+                    .minimumScaleFactor(0.62)
+                    .allowsTightening(true)
             }
-        } else {
-            let valueFontSize = min(
-                9,
-                max(6.6, availableHeight * 0.56)
-            )
-            HStack(spacing: 3) {
-                Text(branch.label)
-                    .font(
-                        .system(
-                            size: max(6.2, valueFontSize - 0.8),
-                            weight: .semibold
-                        )
-                    )
-                    .foregroundStyle(quiet)
-
-                Text(
-                    compactBranchWatt(
-                        branch.power,
-                        approximate: branch.approximate
-                    )
-                )
-                    .font(
-                        .system(
-                            size: valueFontSize,
-                            weight: .bold,
-                            design: .rounded
-                        )
-                    )
-                    .monospacedDigit()
-                    .foregroundStyle(text)
-            }
-            .lineLimit(1)
-            .minimumScaleFactor(0.7)
-            .allowsTightening(true)
-            .padding(.horizontal, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-    }
-
-    private func horizontalCurveProgress(_ progress: CGFloat) -> CGFloat {
-        let t = min(max(progress, 0), 1)
-        let inverse = 1 - t
-        return 3 * inverse * inverse * t * 0.38
-            + 3 * inverse * t * t * 0.68
-            + t * t * t
+        .padding(.horizontal, 9)
+        .frame(width: width, height: height, alignment: .leading)
+        .clipped()
     }
 
     private var batterySymbol: String {
@@ -1539,11 +1416,11 @@ private struct SculptedPowerFlow: View {
             isOnAC
                 ? "电池功率 \(watt(batteryPower, allowZero: true))"
                 : "未连接适配器",
-            "系统负载 \(watt(systemPower, approximate: systemPowerIsEstimated))",
-            "CPU \(watt(cpuPower, approximate: true))",
-            "GPU \(watt(gpuPower, approximate: true))",
+            "系统负载 \(watt(systemPower))",
+            "CPU \(watt(cpuPower))",
+            "GPU \(watt(gpuPower))",
             "显示 \(watt(displayPower))",
-            "其他 \(watt(unclassifiedPower, approximate: true))"
+            "其他 \(watt(unclassifiedPower))"
         ].joined(separator: "；")
     }
 
@@ -1551,27 +1428,26 @@ private struct SculptedPowerFlow: View {
         value.isFinite ? max(0, value) : 0
     }
 
-    private func compactBranchWatt(
+    private func compactWatt(
         _ value: Double,
-        approximate: Bool
-    ) -> String {
-        guard value > 0.02 else { return "—" }
-        let number = value >= 100
-            ? String(format: "%.0f", value)
-            : String(format: "%.1f", max(0, value))
-        return "\(approximate ? "≈" : "")\(number)W"
-    }
-
-    private func watt(
-        _ value: Double,
-        allowZero: Bool = false,
-        approximate: Bool = false
+        allowZero: Bool = false
     ) -> String {
         guard value > 0.02 || allowZero else { return "—" }
         let number = value >= 100
             ? String(format: "%.0f", value)
             : String(format: "%.1f", max(0, value))
-        return "\(approximate ? "≈" : "")\(number) W"
+        return "\(number)W"
+    }
+
+    private func watt(
+        _ value: Double,
+        allowZero: Bool = false
+    ) -> String {
+        guard value > 0.02 || allowZero else { return "—" }
+        let number = value >= 100
+            ? String(format: "%.0f", value)
+            : String(format: "%.1f", max(0, value))
+        return "\(number) W"
     }
 }
 

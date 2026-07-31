@@ -132,6 +132,7 @@ private final class MetricsCoordinator {
     private var processSource: DispatchSourceProcess?
     private var errorBuffer = Data()
     private var requestedStop = false
+    private var outputWasObserved = false
     private var sendData: ((Data) -> Void)?
     private var sendFailure: ((String) -> Void)?
 
@@ -144,13 +145,15 @@ private final class MetricsCoordinator {
         reply: @escaping (Bool, String?) -> Void
     ) {
         queue.async {
+            self.reapFinishedChildIfNeeded()
             guard self.childProcessIdentifier == nil else {
                 if self.ownerIdentifier == owner {
                     reply(true, nil)
                 } else {
                     reply(
                         false,
-                        "Another MacPowerFlow connection is already sampling."
+                        MPFPrivilegedService.retryableSessionBusyMarker +
+                            ": the previous sampling session is still stopping."
                     )
                 }
                 return
@@ -165,6 +168,7 @@ private final class MetricsCoordinator {
                 self.errorDescriptor = spawnedProcess.errorDescriptor
                 self.errorBuffer.removeAll(keepingCapacity: true)
                 self.requestedStop = false
+                self.outputWasObserved = false
                 self.sendData = sendData
                 self.sendFailure = sendFailure
                 self.beginReading(
@@ -181,12 +185,63 @@ private final class MetricsCoordinator {
                     for: spawnedProcess.processIdentifier,
                     owner: owner
                 )
+                self.requestInitialSamples(
+                    processIdentifier: spawnedProcess.processIdentifier,
+                    owner: owner
+                )
                 reply(true, nil)
             } catch {
                 reply(
                     false,
                     "Unable to launch powermetrics: \(error.localizedDescription)"
                 )
+            }
+        }
+    }
+
+    /// Reconciles a process that exited before its dispatch source delivered.
+    /// This closes the short handoff race between one app session invalidating
+    /// its XPC connection and the next session asking to start.
+    private func reapFinishedChildIfNeeded() {
+        guard let processIdentifier = childProcessIdentifier,
+              let owner = ownerIdentifier else {
+            return
+        }
+
+        var waitStatus: Int32 = 0
+        let result = Darwin.waitpid(processIdentifier, &waitStatus, WNOHANG)
+        if result == processIdentifier {
+            finish(
+                processIdentifier: processIdentifier,
+                owner: owner,
+                waitStatus: waitStatus,
+                waitError: nil
+            )
+        } else if result == -1, errno == ECHILD {
+            // A process source may have reaped the child immediately before
+            // this queued start request. Its callback is then harmless because
+            // cleanUp clears the tracked PID and owner.
+            cleanUp()
+        }
+    }
+
+    /// powermetrics can spend several seconds establishing its first delta
+    /// baseline on recent macOS releases. SIGINFO is its documented mechanism
+    /// for requesting an immediate sample. A second guarded request covers the
+    /// case where the first signal arrived during process initialization.
+    private func requestInitialSamples(
+        processIdentifier: pid_t,
+        owner: UUID
+    ) {
+        for delay in [0.75, 3.5] {
+            queue.asyncAfter(deadline: .now() + delay) {
+                guard self.childProcessIdentifier == processIdentifier,
+                      self.ownerIdentifier == owner,
+                      !self.requestedStop,
+                      !self.outputWasObserved else {
+                    return
+                }
+                _ = Darwin.kill(processIdentifier, SIGINFO)
             }
         }
     }
@@ -429,6 +484,7 @@ private final class MetricsCoordinator {
                 let data = Data(buffer.prefix(count))
                 switch kind {
                 case .output:
+                    outputWasObserved = true
                     sendData?(data)
                 case .error:
                     appendErrorOutput(data)
@@ -683,6 +739,7 @@ private final class MetricsCoordinator {
         childProcessIdentifier = nil
         errorBuffer.removeAll(keepingCapacity: false)
         requestedStop = false
+        outputWasObserved = false
         sendData = nil
         sendFailure = nil
     }
@@ -693,7 +750,8 @@ private final class MetricsConnectionService:
     MPFPrivilegedMetricsServiceProtocol
 {
     let ownerIdentifier = UUID()
-    weak var connection: NSXPCConnection?
+    private let connectionLock = NSLock()
+    private var connection: NSXPCConnection?
 
     init(connection: NSXPCConnection) {
         self.connection = connection
@@ -707,7 +765,7 @@ private final class MetricsConnectionService:
     func startSampling(
         withReply reply: @escaping (Bool, String?) -> Void
     ) {
-        guard let connection else {
+        guard currentConnection() != nil else {
             reply(false, "The XPC connection is no longer available.")
             return
         }
@@ -715,21 +773,11 @@ private final class MetricsConnectionService:
         let owner = ownerIdentifier
         MetricsCoordinator.shared.start(
             owner: owner,
-            sendData: { [weak connection] data in
-                guard let proxy = connection?.remoteObjectProxyWithErrorHandler(
-                    { _ in }
-                ) as? MPFPrivilegedMetricsClientProtocol else {
-                    return
-                }
-                proxy.receiveData(data)
+            sendData: { [weak self] data in
+                self?.send(data)
             },
-            sendFailure: { [weak connection] message in
-                guard let proxy = connection?.remoteObjectProxyWithErrorHandler(
-                    { _ in }
-                ) as? MPFPrivilegedMetricsClientProtocol else {
-                    return
-                }
-                proxy.serviceDidFail(message)
+            sendFailure: { [weak self] message in
+                self?.sendFailure(message)
             },
             reply: reply
         )
@@ -746,6 +794,30 @@ private final class MetricsConnectionService:
 
     func connectionWasInvalidated() {
         MetricsCoordinator.shared.stop(owner: ownerIdentifier)
+        connectionLock.lock()
+        connection = nil
+        connectionLock.unlock()
+    }
+
+    private func currentConnection() -> NSXPCConnection? {
+        connectionLock.lock()
+        defer { connectionLock.unlock() }
+        return connection
+    }
+
+    private func clientProxy() -> MPFPrivilegedMetricsClientProtocol? {
+        guard let connection = currentConnection() else { return nil }
+        return connection.remoteObjectProxyWithErrorHandler(
+            { _ in }
+        ) as? MPFPrivilegedMetricsClientProtocol
+    }
+
+    private func send(_ data: Data) {
+        clientProxy()?.receiveData(data)
+    }
+
+    private func sendFailure(_ message: String) {
+        clientProxy()?.serviceDidFail(message)
     }
 }
 

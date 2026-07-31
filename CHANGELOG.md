@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.5.0 — 2026-07-31
+
+- Rebuilt the main energy-flow graphic around continuously weighted ribbons
+  and dedicated label-safe destination nodes, so low-power branches no longer
+  overlap, clip, or hide text as values change.
+- Reworked the adapter and battery presentation into compact independent nodes
+  and removed visible measured/estimated/approximation markers from the app UI.
+- Enumerated the complete local AppleSMC capability table at startup while
+  mapping only independently known read-only keys into the product UI.
+- Preserved missing, unsupported, failed, and real zero-value SMC outcomes;
+  added safe numeric decoding for float, integer, and fixed-point SMC types.
+- Added direct Wi-Fi and USB rail support when the corresponding known SMC keys
+  exist, while retaining dynamic residual allocation when a rail is absent.
+- Increased the IOReport energy-delta window from 100 ms to 500 ms after
+  device testing reproduced zero frames and misleading one-frame GPU spikes;
+  continuous live QA now keeps CPU/GPU branches stable and power-balanced.
+- Added a same-frame physical budget guard: a clearly impossible standard GPU
+  sample falls back to the latest recent valid value, an impossible enhanced
+  GPU sample falls back to the standard channel, and CPU/display values are
+  bounded before the residual branch is calculated.
+- Fixed enhanced sampling incorrectly timing out before `powermetrics` produced
+  its first complete sample on a cold launch.
+- Added initial-sample signalling, stale-child reconciliation, bounded session
+  handoff retries, and durable XPC callback ownership for reliable relaunches.
+- Avoided permanently marking a known SMC key missing unless the complete,
+  uncapped `#KEY` index walk succeeded without a single enumeration failure.
+
 ## 1.4.1 — 2026-07-31
 
 - Fixed “登录时启动” on a clean installation: `.notFound` now performs the

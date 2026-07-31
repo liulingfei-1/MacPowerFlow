@@ -610,7 +610,13 @@ static BOOL gAmcStatsProducesData = NO;
         return data;
     }
 
-    const double interval = 0.1;
+    // A 100 ms window is too short for the Energy Model counters on recent
+    // macOS releases: the GPU channel can occasionally report an empty frame
+    // or turn a very short burst into a misleading one-frame power spike.
+    // Average over 500 ms instead. This remains comfortably below the app's
+    // two-second refresh cadence while matching the stability expected from a
+    // user-facing power meter.
+    const double interval = 0.5;
 
     CFDictionaryRef sample1 = IOReportCreateSamples(gSubscription, gChannels, NULL);
     if (!isCFType(sample1, CFDictionaryGetTypeID())) {

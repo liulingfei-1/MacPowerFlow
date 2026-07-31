@@ -3,6 +3,7 @@
 #define SMC_H
 
 #include <IOKit/IOKitLib.h>
+#include <stdint.h>
 
 #define KERNEL_INDEX_SMC 2
 
@@ -55,11 +56,25 @@ typedef struct {
   SMCKeyData_t data;
 } SMCVal_t;
 
+/// A decoded numeric SMC value together with the firmware type metadata used
+/// to decode it. Callers must still validate the semantic meaning of `key`;
+/// this type deliberately does not infer a sensor name from an unknown FourCC.
+typedef struct {
+  double value;
+  uint32_t dataType;
+  uint32_t dataSize;
+} SMCNumericValue_t;
+
 // Function prototypes
 io_connect_t SMCOpen(void);
 kern_return_t SMCClose(io_connect_t conn);
 kern_return_t SMCReadKey(io_connect_t conn, const char *key, SMCKeyData_t *val);
+/// Decodes only known numeric SMC data types. Returns kIOReturnUnsupported for
+/// an otherwise readable key whose data type is not numeric/recognized.
+kern_return_t SMCReadNumericValue(io_connect_t conn, const char *key,
+                                  SMCNumericValue_t *value);
 double SMCGetFloatValue(io_connect_t conn, const char *key);
+int SMCDataTypeIsNumeric(uint32_t dataType);
 int SMCGetKeyCount(io_connect_t conn);
 kern_return_t SMCGetKeyFromIndex(io_connect_t conn, int index, char *outputKey);
 kern_return_t SMCGetKeyInfo(io_connect_t conn, const char *key,
