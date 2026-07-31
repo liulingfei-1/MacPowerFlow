@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">MacPowerFlow app icon</title>
+  <desc id="description">A dark rounded square containing a glowing green battery and a left-to-right energy flow.</desc>
+  <defs>
+    <linearGradient id="background" x1="136" y1="104" x2="884" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#25302C"/>
+      <stop offset="0.48" stop-color="#111714"/>
+      <stop offset="1" stop-color="#070A09"/>
+    </linearGradient>
+    <radialGradient id="ambientGlow" cx="0" cy="0" r="1" gradientTransform="translate(374 486) rotate(21) scale(480)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#00E676" stop-opacity="0.22"/>
+      <stop offset="0.52" stop-color="#00C96B" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#00C96B" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="energy" x1="154" y1="512" x2="778" y2="512" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#56F59A"/>
+      <stop offset="0.48" stop-color="#0EEA75"/>
+      <stop offset="1" stop-color="#00B85E"/>
+    </linearGradient>
+    <linearGradient id="batteryFill" x1="280" y1="372" x2="620" y2="660" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#46F493"/>
+      <stop offset="1" stop-color="#00B85E"/>
+    </linearGradient>
+    <filter id="greenGlow" x="-40%" y="-40%" width="180%" height="180%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="20" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0
+                                                        0 0 0 0 0.92
+                                                        0 0 0 0 0.45
+                                                        0 0 0 0.55 0" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="softShadow" x="-35%" y="-35%" width="170%" height="180%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#000000" flood-opacity="0.46"/>
+    </filter>
+    <clipPath id="batteryInterior">
+      <rect x="274" y="364" width="438" height="296" rx="74"/>
+    </clipPath>
+  </defs>
+
+  <rect x="64" y="64" width="896" height="896" rx="220" fill="url(#background)"/>
+  <rect x="67" y="67" width="890" height="890" rx="217" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="6"/>
+  <rect x="80" y="80" width="864" height="864" rx="204" fill="url(#ambientGlow)"/>
+
+  <g filter="url(#softShadow)">
+    <rect x="736" y="416" width="112" height="192" rx="48" fill="#1C2823" stroke="#93A69D" stroke-opacity="0.62" stroke-width="26"/>
+    <rect x="228" y="316" width="544" height="392" rx="120" fill="#0B100E" stroke="#C9D5CF" stroke-opacity="0.88" stroke-width="30"/>
+  </g>
+
+  <g clip-path="url(#batteryInterior)">
+    <rect x="274" y="364" width="350" height="296" rx="74" fill="url(#batteryFill)"/>
+    <path d="M228 548C340 446 439 609 548 501C621 430 685 449 760 395" fill="none" stroke="#B9FFD6" stroke-opacity="0.25" stroke-width="22"/>
+    <path d="M242 573C344 473 450 621 562 516C630 452 692 464 761 417" fill="none" stroke="#003D20" stroke-opacity="0.32" stroke-width="10"/>
+  </g>
+
+  <g filter="url(#greenGlow)">
+    <path d="M142 512H302" fill="none" stroke="url(#energy)" stroke-width="34" stroke-linecap="round"/>
+    <path d="M260 458L325 512L260 566" fill="none" stroke="#6BFFAA" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M521 375L405 544H496L458 656L628 467H530L579 375Z" fill="#ECFFF4"/>
+  </g>
+
+  <circle cx="148" cy="512" r="19" fill="#8BFFBB"/>
+  <circle cx="148" cy="512" r="38" fill="none" stroke="#36EB83" stroke-opacity="0.28" stroke-width="10"/>
+</svg>

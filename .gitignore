@@ -1,0 +1,23 @@
+.DS_Store
+.build/
+/build/
+dist/
+
+DerivedData/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+xcuserdata/
+
+*.log
+.env
+.env.*
+!.env.example
+*.cer
+*.key
+*.p12
+*.pem
+*.provisionprofile
+
+# Local QA duplicate retained in the workspace but not part of the release.
+design-qa 2.md
