@@ -1,5 +1,6 @@
 import Foundation
 import IOKit
+import IOKit.ps
 
 nonisolated struct BatterySnapshot: Sendable {
     var isPresent = false
@@ -34,8 +35,19 @@ nonisolated struct BatterySnapshot: Sendable {
     var adapterName = ""
 
     var timeDescription: String {
+        if isCharging {
+            return formattedMinutes(timeToFullMinutes)
+        }
         if isFullyCharged { return "已充满" }
-        let minutes = isCharging ? timeToFullMinutes : timeToEmptyMinutes
+        if isOnAC { return "已接电源 · 未充电" }
+        return formattedMinutes(timeToEmptyMinutes)
+    }
+
+    var timeToFullDescription: String {
+        formattedMinutes(timeToFullMinutes)
+    }
+
+    private func formattedMinutes(_ minutes: Int) -> String {
         guard minutes > 0, minutes < 65_535 else { return "正在计算" }
         let hours = minutes / 60
         let remainder = minutes % 60
@@ -47,6 +59,7 @@ nonisolated struct BatterySnapshot: Sendable {
 
 enum BatteryReader {
     nonisolated static func read() -> BatterySnapshot {
+        let powerSource = readPowerSourceState()
         let service = IOServiceGetMatchingService(
             kIOMainPortDefault,
             IOServiceMatching("AppleSmartBattery")
@@ -81,12 +94,13 @@ enum BatteryReader {
 
         var result = BatterySnapshot()
         result.isPresent = true
-        result.level = firstInt("CurrentCapacity")
-        result.isCharging = (bool(property("IsCharging")) ?? false)
-            || (bool(chargerData["IsCharging"]) ?? false)
-        result.isFullyCharged = (bool(property("FullyCharged")) ?? false)
-            || (bool(batteryData["FullyCharged"]) ?? false)
-        result.isOnAC = (bool(property("ExternalConnected")) ?? false)
+        let registryLevel = int(property("CurrentCapacity"))
+            ?? int(batteryData["CurrentCapacity"])
+        result.level = normalizedLevel(
+            registryLevel: registryLevel,
+            powerSourceCurrent: powerSource.currentCapacity,
+            powerSourceMaximum: powerSource.maximumCapacity
+        )
 
         let virtualTemperature = int(property("VirtualTemperature"))
             ?? int(batteryData["VirtualTemperature"])
@@ -110,8 +124,11 @@ enum BatteryReader {
             : (int(batteryData["RemainingCapacity"]) ?? 0)
 
         let rawMax = firstInt("AppleRawMaxCapacity")
+        let fullCharge = firstInt("FullChargeCapacity")
         let nominal = firstInt("NominalChargeCapacity")
-        result.fullCapacityMAh = rawMax > 0 ? rawMax : nominal
+        result.fullCapacityMAh = rawMax > 0
+            ? rawMax
+            : (fullCharge > 0 ? fullCharge : nominal)
         result.designCapacityMAh = firstInt("DesignCapacity")
         let healthCapacity = nominal > 0 ? nominal : result.fullCapacityMAh
         if result.designCapacityMAh > 0 {
@@ -121,8 +138,14 @@ enum BatteryReader {
             )
         }
 
-        result.timeToFullMinutes = firstInt("AvgTimeToFull")
-        result.timeToEmptyMinutes = firstInt("AvgTimeToEmpty")
+        result.timeToFullMinutes = firstPositiveInt(
+            firstInt("AvgTimeToFull"),
+            powerSource.timeToFullMinutes
+        )
+        result.timeToEmptyMinutes = firstPositiveInt(
+            firstInt("AvgTimeToEmpty"),
+            powerSource.timeToEmptyMinutes
+        )
         if result.timeToEmptyMinutes == 0 {
             result.timeToEmptyMinutes = firstInt("TimeRemaining", fallback: [:])
         }
@@ -147,19 +170,129 @@ enum BatteryReader {
         )
         result.batteryVoltage = rawBatteryVoltage / 1000.0
         result.batteryCurrent = rawBatteryCurrent / 1000.0
-        if abs(telemetryBatteryMW) > 0.5 {
-            result.batteryFlowWatts = abs(telemetryBatteryMW) / 1000.0
-        } else if result.isCharging {
-            let chargingVoltage = number(chargerData["ChargingVoltage"])
-            let chargingCurrent = number(chargerData["ChargingCurrent"])
-            result.batteryFlowWatts = abs(chargingVoltage * chargingCurrent) / 1_000_000.0
+        let chargingVoltage = number(chargerData["ChargingVoltage"])
+        let chargingCurrent = number(chargerData["ChargingCurrent"])
+        let gaugePowerWatts = saneBatteryPower(
+            rawBatteryVoltage * rawBatteryCurrent / 1_000_000.0
+        )
+        let telemetryPowerWatts = saneBatteryPower(
+            telemetryBatteryMW / 1_000.0
+        )
+        let resolvedState = BatteryStateCore.resolve(
+            BatteryStateSignals(
+                registryIsCharging: bool(property("IsCharging")) ?? false,
+                chargerIsCharging: bool(chargerData["IsCharging"]) ?? false,
+                powerSourcesIsCharging: powerSource.isCharging,
+                registryFullyCharged: (bool(property("FullyCharged")) ?? false)
+                    || (bool(batteryData["FullyCharged"]) ?? false),
+                powerSourcesFullyCharged: powerSource.isFullyCharged,
+                registryOnAC: bool(property("ExternalConnected")) ?? false,
+                rawRegistryOnAC: bool(property("AppleRawExternalConnected"))
+                    ?? false,
+                powerSourcesOnAC: powerSource.isOnAC,
+                chargingCurrentMilliamps: chargingCurrent,
+                hasMeasuredBatteryPower: gaugePowerWatts > 0.02
+                    || telemetryPowerWatts > 0.02
+            )
+        )
+        result.isCharging = resolvedState.isCharging
+        result.isFullyCharged = resolvedState.isFullyCharged
+        result.isOnAC = resolvedState.isOnAC
+
+        if result.isCharging {
+            result.batteryFlowWatts = firstPositive(
+                gaugePowerWatts,
+                telemetryPowerWatts,
+                saneBatteryPower(
+                    rawBatteryVoltage * chargingCurrent / 1_000_000.0
+                ),
+                saneBatteryPower(
+                    chargingVoltage * chargingCurrent / 1_000_000.0
+                )
+            )
         } else if !result.isOnAC {
-            result.batteryFlowWatts =
-                rawBatteryVoltage * abs(rawBatteryCurrent) / 1_000_000.0
+            result.batteryFlowWatts = firstPositive(
+                gaugePowerWatts,
+                telemetryPowerWatts
+            )
+        } else {
+            result.batteryFlowWatts = 0
         }
 
         result.externalPowerOutWatts = readExternalPower(property("PowerOutDetails"))
         return result
+    }
+
+    private nonisolated struct PowerSourceState {
+        var isCharging = false
+        var isFullyCharged = false
+        var isOnAC = false
+        var currentCapacity = 0
+        var maximumCapacity = 0
+        var timeToFullMinutes = 0
+        var timeToEmptyMinutes = 0
+    }
+
+    /// IOPowerSources is Apple's public, normalized view of the same battery.
+    /// Use it as a second signal because it can update before or after the raw
+    /// AppleSmartBattery properties during a charge-state transition.
+    nonisolated private static func readPowerSourceState() -> PowerSourceState {
+        guard let unmanagedBlob = IOPSCopyPowerSourcesInfo() else {
+            return PowerSourceState()
+        }
+        let blob = unmanagedBlob.takeRetainedValue()
+        guard let unmanagedSources = IOPSCopyPowerSourcesList(blob) else {
+            return PowerSourceState()
+        }
+        let sources = unmanagedSources.takeRetainedValue() as Array
+
+        for source in sources {
+            guard let description = IOPSGetPowerSourceDescription(blob, source)
+                .takeUnretainedValue() as? [String: Any],
+                (description["Type"] as? String) == "InternalBattery" else {
+                continue
+            }
+
+            return PowerSourceState(
+                isCharging: bool(description["Is Charging"]) ?? false,
+                isFullyCharged: bool(description["Is Charged"]) ?? false,
+                isOnAC: (description["Power Source State"] as? String)
+                    == "AC Power",
+                currentCapacity: int(description["Current Capacity"]) ?? 0,
+                maximumCapacity: int(description["Max Capacity"]) ?? 0,
+                timeToFullMinutes: int(description["Time to Full Charge"]) ?? 0,
+                timeToEmptyMinutes: int(description["Time to Empty"]) ?? 0
+            )
+        }
+        return PowerSourceState()
+    }
+
+    nonisolated private static func normalizedLevel(
+        registryLevel: Int?,
+        powerSourceCurrent: Int,
+        powerSourceMaximum: Int
+    ) -> Int {
+        if let registryLevel, (0...100).contains(registryLevel) {
+            return registryLevel
+        }
+        guard powerSourceCurrent >= 0, powerSourceMaximum > 0 else { return 0 }
+        return min(
+            100,
+            max(0, Int((Double(powerSourceCurrent) / Double(powerSourceMaximum) * 100).rounded()))
+        )
+    }
+
+    nonisolated private static func firstPositiveInt(_ values: Int...) -> Int {
+        values.first { $0 > 0 && $0 < 65_535 } ?? 0
+    }
+
+    nonisolated private static func firstPositive(_ values: Double...) -> Double {
+        values.first { $0.isFinite && $0 > 0.02 } ?? 0
+    }
+
+    nonisolated private static func saneBatteryPower(_ value: Double) -> Double {
+        let magnitude = abs(value)
+        return magnitude.isFinite && magnitude < 200 ? magnitude : 0
     }
 
     nonisolated private static func readExternalPower(_ value: Any?) -> Double {

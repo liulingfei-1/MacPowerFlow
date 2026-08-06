@@ -83,7 +83,7 @@ actor HardwareSampler {
     private var smcMissingKeyShortCircuitIsSafe = false
 
     private let smcKeys = [
-        "PPBR", "PDTR", "PSTR", "PHPC", "PDBR", "PBwo",
+        "PPBR", "PDTR", "PSTR", "PHPC", "PDBR", "PBwo", "CHCC",
         "PCPT", "PCTR", "PCPR", "PCPC", "PC0C", "PCAM",
         "PC0R", "PC0G", "PCEC",
         "PG0R", "PG0C", "PG1R", "PCPG", "PCGC", "PCGM",

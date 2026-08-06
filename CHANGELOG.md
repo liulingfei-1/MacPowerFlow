@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.5.2 — 2026-08-06
+
+- Reconciled raw AppleSmartBattery flags with the public IOPowerSources state,
+  `AppleRawExternalConnected`, charger activity and the known SMC `CHCC`
+  signal, so cable and charging transitions no longer depend on one lagging
+  boolean.
+- Added an IOPowerSources change watcher for immediate refresh when AC power or
+  charging state changes, while retaining the regular two-second sample loop.
+- Made live SMC `PPBR` the preferred battery-flow magnitude and stopped using
+  the charger's single-cell voltage as the primary whole-pack power estimate.
+- Kept active charging ahead of a stale full flag, while suppressing `CHCC`
+  residue when the system has already confirmed a fully charged battery.
+- Restored the percent sign in the main battery rail and added explicit
+  “正在充电 · 充入 xW”, “电池输出” and “已接电源 · 未充电” states.
+- Rebuilt the battery branch as a directional flow: charging uses a green
+  left-pointing arrow into the battery, discharge points toward the system,
+  and an idle/full battery leaves only a thin neutral connection.
+- Extended the charging preview to exercise the complete main panel instead of
+  tinting only the menu-bar icon, and added six battery-state regression tests.
+
+## 1.5.1 — 2026-08-01
+
+- Expanded the native system About panel with a polished project summary
+  containing the GitHub repository, live version/build metadata, an explicit
+  dependency statement, five open-source acknowledgements, and bundled full
+  license documents.
+- Accepted complete XML plist documents as immediate powermetrics frame
+  boundaries in addition to NUL delimiters. This removes the one-frame startup
+  delay seen when macOS prefixes each frame with NUL and prevents a healthy
+  enhanced stream from racing the startup watchdog.
+- Kept an immediately decoded first frame even when it arrives before the XPC
+  start reply, and prevented that later reply from downgrading active sampling
+  back to its startup state.
+- Fixed intermittent CPU-power disappearance when `powermetrics` publishes a
+  zero or partial `cpu_power` frame while CPU activity remains nonzero.
+- Added the same-frame `cpu_energy / elapsed_ns` average-power fallback used by
+  established Apple Silicon monitors, covering CPU, GPU and ANE domains.
+- Added a combined-package residual, standard IOReport value and conservative
+  local estimate as ordered CPU fallbacks instead of letting a zero enhanced
+  field suppress every lower-priority source.
+- Reconciled CPU and GPU together when asynchronous candidates exceed their
+  shared system budget, so GPU evaluation order no longer makes only CPU vanish.
+- Switched the privileged plist stream to unbuffered output, paired guarded
+  immediate-sample requests with explicit flush signals, and extended the cold
+  startup safety window so a delayed first frame does not disable enhancement.
+- Added eight host-free regression tests for plist energy conversion, zero and
+  partial frames, fallback priority, invalid intervals and budget allocation.
+
 ## 1.5.0 — 2026-07-31
 
 - Rebuilt the main energy-flow graphic around continuously weighted ribbons

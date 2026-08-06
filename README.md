@@ -12,7 +12,7 @@ MacPowerFlow 是一款面向 Apple Silicon Mac 的轻量级菜单栏功耗监视
 
 - 菜单栏把电量数字直接放入电池图标，省略百分号、分隔圆点和额外空格，紧接整机实时负载；充电时电池变绿，未充电时保持系统标签色。
 - 用连续块状能量流展示适配器、电池、整机、CPU、GPU、显示和“其他”残差；各流道宽度与实时功耗联动，文字放在与流道连体的安全节点内，极低或极高功耗都不会相互遮挡。
-- 主视觉先按同一帧整机预算校验各支路：明显异常的 GPU 瞬时值会回退到最近合理样本，CPU、GPU、显示与“其他”始终保持非负且不会合计超过整机负载。
+- 主视觉先按同一帧整机预算校验各支路：明显异常的 GPU 瞬时值会回退到最近合理样本，CPU 与 GPU 超出共同预算时会同步按比例收敛，不再因计算顺序只让 CPU 消失；CPU、GPU、显示与“其他”始终保持非负且不会合计超过整机负载。
 - 首次启动只请求一次 macOS 管理员批准，用于安装受限的只读增强服务；之后启动应用或重启电脑都会直接连接，不再反复输入密码。
 - 展示电池温度、循环次数、按满充/设计容量估算的健康度、容量和预计充满或用尽时间。
 - 展示电池与适配器的电压、电流、标称功率，以及实时输入、转换损耗和外接设备输出功率。
@@ -21,6 +21,7 @@ MacPowerFlow 是一款面向 Apple Silicon Mac 的轻量级菜单栏功耗监视
 - “其他”优先列出 ANE、内存、媒体引擎、无线网络和 USB 等可读通道；没有独立瓦数时，再按整机负载、内存带宽、芯片活跃度与风扇转速动态分配 4–6 个项目。界面只保留紧凑数值，数据口径统一记录在本文档中。
 - 列出当前 CPU 占用排序靠前的最多三个进程；这里的百分比不是逐应用功耗瓦数。
 - 对缺失或暂时不可用的传感器显示“—”；拿不到管理员 CPU 字段时，会根据可见 SoC 残差或整机负载与 CPU 活跃度给出保守回退值。
+- “关于 MacPowerFlow”提供 GitHub 仓库、当前版本、实际采用的开源参考项目，以及可在应用内选择复制的完整许可证与第三方声明。
 
 功耗采样并非严格同时发生，而且 CPU、GPU、ANE、DRAM 只是整机功耗的一部分。它们的合计不会等于整机功耗；屏幕、SSD、无线模块、电源转换损耗等也会消耗电力。
 
@@ -54,7 +55,7 @@ Intel Mac 不在当前支持范围内。没有内置电池的 Mac mini、Mac Stu
 
 1. 在独立临时目录中执行 arm64 Release 构建；
 2. 按 helper、安装器、外层 App 的顺序进行 hardened ad-hoc 签名，并逐项验证；
-3. 生成并解包复验不携带 Finder 扩展属性的 `dist/MacPowerFlow-1.5.0.zip`；
+3. 生成并解包复验不携带 Finder 扩展属性的 `dist/MacPowerFlow-1.5.2.zip`；
 4. 如果已有旧版本，先把它安全地移动到 `.build/previous-releases/`，而不是直接删除。
 
 分发或安装时使用压缩包：双击解压后，把 `MacPowerFlow.app` 拖入“应用程序”文件夹。发布目录不额外保留裸 `.app`，因为 Finder 或同步目录可能在其上重新附加扩展属性并破坏签名；构建脚本会直接复验 ZIP 解包后的应用。
@@ -63,7 +64,7 @@ ad-hoc 签名只适合本机开发和测试；“登录时启动”也应在应�
 
 ## 使用
 
-启动后，MacPowerFlow 会出现在菜单栏并定期刷新采样。第一次使用这个版本时，macOS 会显示一次管理员认证；通过后，应用安装固定用途的增强服务并立即开始采样。以后重新打开应用或重启电脑都直接连接该服务，不再要求密码。左键点击图标可打开功耗面板；右键点击可立即刷新、设置登录时启动、查看“关于”或退出应用。首次开启“登录时启动”会直接注册主应用；如果 macOS 要求额外批准，菜单会保持半选状态并引导到“系统设置 → 通用 → 登录项与扩展”。用于截图和界面验收的 `--preview` 启动参数会跳过增强服务安装与连接。
+启动后，MacPowerFlow 会出现在菜单栏并定期刷新采样。第一次使用这个版本时，macOS 会显示一次管理员认证；通过后，应用安装固定用途的增强服务并立即开始采样。以后重新打开应用或重启电脑都直接连接该服务，不再要求密码。左键点击图标可打开功耗面板；右键点击可立即刷新、设置登录时启动、查看“关于”或退出应用。首次开启“登录时启动”会直接注册主应用；如果 macOS 要求额外批准，菜单会保持半选状态并引导到“系统设置 → 通用 → 登录项与扩展”。用于界面验收的 `--preview`、`--preview-charging` 和 `--preview-about` 启动参数会跳过增强服务安装与连接。
 
 应用不需要辅助功能、屏幕录制或完全磁盘访问权限。它不读取或保存密码，也不修改 `sudoers`。首次认证的用途会在系统对话框中说明；只有用户批准后才安装 launchd 管理的 root helper。
 
@@ -81,13 +82,13 @@ root helper 只开放“协议版本、开始采样、停止采样”三个固�
 
 首次认证期间，主应用不会直接以 root 执行位于普通用户可写 App 包内的安装器。它先让系统自带的 `/usr/bin/install` 把已验签的 helper 与安装器复制到 `/Library/PrivilegedHelperTools` 下两个固定、root 所有的临时路径，再从该只读位置重新比对 identifier 与 CDHash；只有完全一致才运行安装器。安装器不接收来源路径、目标路径或 shell 命令，完成或失败后都会清理临时文件。
 
-管理员流提供 Apple 单独计算的 CPU、GPU、ANE、CPU+GPU+ANE 合计、频率、活跃度和热压力。主视觉中的 CPU / GPU 会逐项优先使用最近且仍然新鲜的增强数据；CPU 字段缺失或授权未完成时，CPU 会回退到本地模型，GPU 缺失时仍使用普通 IOReport 可见值。
+管理员流提供 Apple 单独计算的 CPU、GPU、ANE、CPU+GPU+ANE 合计、频率、活跃度和热压力。helper 使用无缓冲 plist 管道，并在冷启动暂无完整帧时请求即时采样和刷新输出；解析器兼容 NUL 位于帧前或帧后的输出，也会在完整 XML 到达时立即处理首帧。应用给首帧保留 60 秒安全窗口，稳定采样的新鲜度判断仍为 8 秒。主视觉中的 CPU / GPU 会逐项优先使用最近且仍然新鲜的增强数据；若 `cpu_power` 暂时为 0 或缺失，解析器先使用同一采样窗的 `cpu_energy / elapsed_ns` 还原平均功率，再依次尝试增强合计残差、普通 IOReport 通道和本地 CPU 模型。GPU / ANE 的零值帧也使用相同的能量字段回退。
 
 `powermetrics` 自己也明确说明这些功耗数字来自能耗模型，可能不准确，而且不适合跨设备比较。为保持面板紧凑，界面不再给数值添加来源前缀；`CPU+GPU+ANE` 合计仍不会被当作整机功耗，“其他”仍由整机负载扣除 CPU、GPU 与显示得到。
 
-当前 ZIP 使用 hardened ad-hoc 签名，安装时会精确绑定当前 1.5.0 App。因此这个版本安装一次后，日常启动与系统重启都不再输入密码；若以后替换 App 二进制，CDHash 会变化，升级后的版本必须再批准一次。这样避免让旧 root helper 无条件信任任意新文件。
+当前 ZIP 使用 hardened ad-hoc 签名，安装时会精确绑定当前 1.5.2 App。因此这个版本安装一次后，日常启动与系统重启都不再输入密码；若以后替换 App 二进制，CDHash 会变化，升级后的版本必须再批准一次。这样避免让旧 root helper 无条件信任任意新文件。
 
-若要正式分发并在升级后继续保持稳定身份，应使用同一 Team 的 Developer ID Application 签名、公证，并迁移到 Apple 推荐的 `SMAppService` LaunchDaemon。当前机器没有 Developer ID 身份，因此 1.5.0 采用本机可工作的固定版本安装方式，而没有伪装成一个实际上无法获批的 `SMAppService` 包。
+若要正式分发并在升级后继续保持稳定身份，应使用同一 Team 的 Developer ID Application 签名、公证，并迁移到 Apple 推荐的 `SMAppService` LaunchDaemon。当前机器没有 Developer ID 身份，因此 1.5.2 采用本机可工作的固定版本安装方式，而没有伪装成一个实际上无法获批的 `SMAppService` 包。
 
 如需完整移除增强服务，可在终端运行以下精确命令；它们只删除 MacPowerFlow 的固定系统项目和可能残留的两个安装临时文件：
 
@@ -105,11 +106,12 @@ sudo rmdir "/Library/Application Support/com.llf.MacPowerFlow" 2>/dev/null || tr
 
 | 数据 | 来源 | 说明 |
 | --- | --- | --- |
-| 电池电量、状态、温度、容量、循环、时间 | IOKit `AppleSmartBattery` IORegistry 属性 | IOKit 本身是公开框架，但许多具体属性没有稳定的公开契约 |
+| 电池电量、状态、温度、容量、循环、时间 | 公开 IOPowerSources 状态 + IOKit `AppleSmartBattery` IORegistry 属性 | 合并 `Is Charging`、AC 状态和原始电池属性；电源变化通知会触发立即刷新 |
+| 电池实时功率与充电佐证 | AppleSMC `PPBR`、`CHCC`，回退到整包电池遥测 | `PPBR` 只作实时功率幅值；方向由系统充电/供电状态决定，`CHCC` 不作为瓦数显示 |
 | 适配器标称功率和电源遥测 | `AdapterDetails`、`ChargerData`、`PowerTelemetryData` | 字段是否存在取决于机型和系统版本 |
 | 整机、适配器、显示、无线网络、USB、SoC 热功耗和芯片温度 | AppleSMC 已知只读键，例如 `PSTR`、`PDTR`、`PDBR`、`wiPm`、`PUSB`、`PHPC` | 启动时枚举 `#KEY` 能力表；只有语义已核对的键进入界面，未知键仅用于诊断 |
 | CPU/GPU/ANE/DRAM、GPU SRAM、媒体、ISP、Fabric、PCIe、显示控制器功耗 | IOReport 的 Energy Model / Energy Counters 通道 | 私有、未文档化接口；使用 500ms 相邻能量样本差值抑制短窗尖峰，不同机型只显示实际存在的通道 |
-| 管理员 CPU/GPU/ANE 功耗、频率、活跃度和热压力 | Apple `/usr/bin/powermetrics` 的 NUL 分隔 plist 输出 | 首次批准后由受限 root helper 运行固定参数、单条应用会话级连续流；功耗为 Apple 估算值，单位由 mW 换算为 W |
+| 管理员 CPU/GPU/ANE 功耗、频率、活跃度和热压力 | Apple `/usr/bin/powermetrics` 的 NUL 分隔 plist 输出 | 首次批准后由受限 root helper 运行固定参数、单条应用会话级连续流；优先读取平均功率 mW，零值或缺帧时用同帧能量 mJ 和 `elapsed_ns` 还原 W |
 | CPU 回退模型 | 可见 SoC 功耗残差；缺失时使用整机负载与 CPU tick 活跃度的保守曲线 | 仅在拿不到新鲜管理员 CPU 字段和普通 CPU 能量通道时使用 |
 | “其他”未覆盖分项模型 | “其他”残差预算与整机负载、内存带宽、芯片活跃度、风扇转速代理信号 | 只分配直接通道未覆盖的剩余量，合计不会超过“其他”预算 |
 | CPU 集群活跃度与频率、GPU 使用率与频率 | IOReport 的 CPU Stats / GPU Stats 通道 | 使用 DVFS 状态驻留时间换算 |
@@ -133,7 +135,7 @@ sudo rmdir "/Library/Application Support/com.llf.MacPowerFlow" 2>/dev/null || tr
 
 ## 开源方案
 
-本项目在实现和兼容性处理上参考了 macpow、MacMonitor、Powerflow、WhatBattery 和 mactop，并在管理员采样设计前核对了 macmon、powermetrics-go 与 monmon 对 `powermetrics` 流式 plist 和字段口径的处理，避免重复猜测已有格式。持久 helper 的生命周期还核对了 Apple 的 SMAppService 示例、SecureXPC、Objective-See BlockBlock 和 Lidless；只借鉴受限协议、连接生命周期与签名验证思路，没有复制示例中接受所有客户端或暴露任意 shell 命令的不安全做法。MacPowerFlow 的解析器和固定安装流程按本应用的数据模型独立实现。相关改编项目的版权与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本项目在实现和兼容性处理上参考了 macpow、MacMonitor、Powerflow、WhatBattery 和 mactop，并在管理员采样设计前核对了 pumas、macmon、powermetrics-go 与 monmon 对 `powermetrics` 流式 plist 和字段口径的处理，避免重复猜测已有格式。持久 helper 的生命周期还核对了 Apple 的 SMAppService 示例、SecureXPC、Objective-See BlockBlock 和 Lidless；只借鉴受限协议、连接生命周期与签名验证思路，没有复制示例中接受所有客户端或暴露任意 shell 命令的不安全做法。MacPowerFlow 的解析器和固定安装流程按本应用的数据模型独立实现。相关改编项目的版权与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 MacPowerFlow 自身采用 [MIT License](LICENSE)。
 
