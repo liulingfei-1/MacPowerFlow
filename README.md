@@ -15,7 +15,7 @@ MacPowerFlow 是一款面向 Apple Silicon Mac 的轻量级菜单栏功耗监视
 - 主视觉先按同一帧整机预算校验各支路：明显异常的 GPU 瞬时值会回退到最近合理样本，CPU 与 GPU 超出共同预算时会同步按比例收敛，不再因计算顺序只让 CPU 消失；CPU、GPU、显示与“其他”始终保持非负且不会合计超过整机负载。
 - 首次启动只请求一次 macOS 管理员批准，用于安装受限的只读增强服务；之后启动应用或重启电脑都会直接连接，不再反复输入密码。
 - 展示电池温度、循环次数、按满充/设计容量估算的健康度、容量和预计充满或用尽时间。
-- 展示电池与适配器的电压、电流、标称功率，以及实时输入、转换损耗和外接设备输出功率。
+- 展示电池与适配器的实时输入电压、电流和功率，以及转换损耗与外接设备输出功率；充电器协商的电压、电流和功率上限会单独标为“协商上限”，不再与实时输入混淆。
 - 主视觉直接展示 CPU 与 GPU 功耗；展开区只补充 ANE、DRAM、媒体引擎、ISP、芯片互联和 PCIe 等未在主图中单列的可用分项，避免重复。
 - 展示整机功耗、CPU 平均/热点温度、GPU 温度/频率、CPU 集群活跃度与频率、双风扇转速和 DRAM 读写带宽。
 - “其他”优先列出 ANE、内存、媒体引擎、无线网络和 USB 等可读通道；没有独立瓦数时，再按整机负载、内存带宽、芯片活跃度与风扇转速动态分配 4–6 个项目。界面只保留紧凑数值，数据口径统一记录在本文档中。
@@ -55,7 +55,7 @@ Intel Mac 不在当前支持范围内。没有内置电池的 Mac mini、Mac Stu
 
 1. 在独立临时目录中执行 arm64 Release 构建；
 2. 按 helper、安装器、外层 App 的顺序进行 hardened ad-hoc 签名，并逐项验证；
-3. 生成并解包复验不携带 Finder 扩展属性的 `dist/MacPowerFlow-1.5.2.zip`；
+3. 生成并解包复验不携带 Finder 扩展属性的 `dist/MacPowerFlow-1.5.3.zip`；
 4. 如果已有旧版本，先把它安全地移动到 `.build/previous-releases/`，而不是直接删除。
 
 分发或安装时使用压缩包：双击解压后，把 `MacPowerFlow.app` 拖入“应用程序”文件夹。发布目录不额外保留裸 `.app`，因为 Finder 或同步目录可能在其上重新附加扩展属性并破坏签名；构建脚本会直接复验 ZIP 解包后的应用。
@@ -86,9 +86,9 @@ root helper 只开放“协议版本、开始采样、停止采样”三个固�
 
 `powermetrics` 自己也明确说明这些功耗数字来自能耗模型，可能不准确，而且不适合跨设备比较。为保持面板紧凑，界面不再给数值添加来源前缀；`CPU+GPU+ANE` 合计仍不会被当作整机功耗，“其他”仍由整机负载扣除 CPU、GPU 与显示得到。
 
-当前 ZIP 使用 hardened ad-hoc 签名，安装时会精确绑定当前 1.5.2 App。因此这个版本安装一次后，日常启动与系统重启都不再输入密码；若以后替换 App 二进制，CDHash 会变化，升级后的版本必须再批准一次。这样避免让旧 root helper 无条件信任任意新文件。
+当前 ZIP 使用 hardened ad-hoc 签名，安装时会精确绑定当前 1.5.3 App。因此这个版本安装一次后，日常启动与系统重启都不再输入密码；若以后替换 App 二进制，CDHash 会变化，升级后的版本必须再批准一次。这样避免让旧 root helper 无条件信任任意新文件。
 
-若要正式分发并在升级后继续保持稳定身份，应使用同一 Team 的 Developer ID Application 签名、公证，并迁移到 Apple 推荐的 `SMAppService` LaunchDaemon。当前机器没有 Developer ID 身份，因此 1.5.2 采用本机可工作的固定版本安装方式，而没有伪装成一个实际上无法获批的 `SMAppService` 包。
+若要正式分发并在升级后继续保持稳定身份，应使用同一 Team 的 Developer ID Application 签名、公证，并迁移到 Apple 推荐的 `SMAppService` LaunchDaemon。当前机器没有 Developer ID 身份，因此 1.5.3 采用本机可工作的固定版本安装方式，而没有伪装成一个实际上无法获批的 `SMAppService` 包。
 
 如需完整移除增强服务，可在终端运行以下精确命令；它们只删除 MacPowerFlow 的固定系统项目和可能残留的两个安装临时文件：
 
@@ -107,8 +107,8 @@ sudo rmdir "/Library/Application Support/com.llf.MacPowerFlow" 2>/dev/null || tr
 | 数据 | 来源 | 说明 |
 | --- | --- | --- |
 | 电池电量、状态、温度、容量、循环、时间 | 公开 IOPowerSources 状态 + IOKit `AppleSmartBattery` IORegistry 属性 | 合并 `Is Charging`、AC 状态和原始电池属性；电源变化通知会触发立即刷新 |
-| 电池实时功率与充电佐证 | AppleSMC `PPBR`、`CHCC`，回退到整包电池遥测 | `PPBR` 只作实时功率幅值；方向由系统充电/供电状态决定，`CHCC` 不作为瓦数显示 |
-| 适配器标称功率和电源遥测 | `AdapterDetails`、`ChargerData`、`PowerTelemetryData` | 字段是否存在取决于机型和系统版本 |
+| 电池实时功率与充电佐证 | `PowerTelemetryData`、AppleSMC `PDTR` / `PSTR` / `PPBR` / `CHCC` | 充电优先采用同一 `PowerTelemetryData` 样本中的 `SystemPowerIn`、`SystemLoad`、`BatteryPower` 三元组，缺失时使用 `PDTR - PSTR`，并以整包电压 × 电流校验或补齐缺腿；短暂缺帧只沿用上一份完整三元组，不再混用异步值。`PPBR` 仅用于电池放电，`CHCC` 只佐证充电状态，不作为瓦数显示 |
+| 适配器实时输入与协商上限 | `PowerTelemetryData`、AppleSMC `PDTR`，以及 `AdapterDetails` / `ChargerData` | 实时电压、电流、功率与充电器协商或声明的上限分开显示；字段是否存在取决于机型和系统版本 |
 | 整机、适配器、显示、无线网络、USB、SoC 热功耗和芯片温度 | AppleSMC 已知只读键，例如 `PSTR`、`PDTR`、`PDBR`、`wiPm`、`PUSB`、`PHPC` | 启动时枚举 `#KEY` 能力表；只有语义已核对的键进入界面，未知键仅用于诊断 |
 | CPU/GPU/ANE/DRAM、GPU SRAM、媒体、ISP、Fabric、PCIe、显示控制器功耗 | IOReport 的 Energy Model / Energy Counters 通道 | 私有、未文档化接口；使用 500ms 相邻能量样本差值抑制短窗尖峰，不同机型只显示实际存在的通道 |
 | 管理员 CPU/GPU/ANE 功耗、频率、活跃度和热压力 | Apple `/usr/bin/powermetrics` 的 NUL 分隔 plist 输出 | 首次批准后由受限 root helper 运行固定参数、单条应用会话级连续流；优先读取平均功率 mW，零值或缺帧时用同帧能量 mJ 和 `elapsed_ns` 还原 W |
@@ -121,7 +121,7 @@ sudo rmdir "/Library/Application Support/com.llf.MacPowerFlow" 2>/dev/null || tr
 | 低电量模式 | Foundation `ProcessInfo` | Apple 提供的公开系统状态接口 |
 | 高 CPU 进程 | 系统 `ps` 命令 | 仅采集进程名与 CPU 百分比，不把它描述为逐应用瓦数 |
 
-适配器“标称功率”代表充电器协商或声明的上限，不等同于此刻实际输入功率。界面会把两者分开显示。
+适配器“协商上限”代表充电器协商或声明的电压、电流和功率上限，不等同于此刻的实时输入。界面会把两者分开显示，并在同源遥测可用时保持“适配器输入 = 整机负载 + 电池充入”的功率守恒关系。
 
 ## 权限、隐私与发布限制
 

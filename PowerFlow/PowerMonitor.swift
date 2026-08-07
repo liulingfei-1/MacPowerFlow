@@ -76,6 +76,8 @@ final class PowerMonitor: ObservableObject {
     @Published private(set) var adapterRatedWatts = 0.0
     @Published private(set) var adapterVoltage = 0.0
     @Published private(set) var adapterCurrent = 0.0
+    @Published private(set) var systemInputVoltage = 0.0
+    @Published private(set) var systemInputCurrent = 0.0
     @Published private(set) var adapterName = ""
     @Published private(set) var adapterInputWatts = 0.0
     @Published private(set) var systemLoadWatts = 0.0
@@ -168,6 +170,7 @@ final class PowerMonitor: ObservableObject {
 
     private let sampleIntervalNanoseconds: UInt64 = 2_000_000_000
     private let processInterval: TimeInterval = 10
+    private let chargingBalanceFreshness: TimeInterval = 6
     private let hardwareSampler = HardwareSampler()
     private let privilegedPowerSampler = PrivilegedPowerSampler()
 
@@ -176,6 +179,8 @@ final class PowerMonitor: ObservableObject {
     private var processTask: Task<Void, Never>?
     private var lastProcessRefresh = Date.distantPast
     private var previousCPUTicks: [[UInt32]] = []
+    private var lastChargingPowerBalance: ChargingPowerBalance?
+    private var lastChargingPowerBalanceDate = Date.distantPast
     private var administratorStartupWatchdogTask: Task<Void, Never>?
     private var powerSourceRunLoopSource: CFRunLoopSource?
     private var administratorTerminalError: String?
@@ -286,6 +291,8 @@ final class PowerMonitor: ObservableObject {
         adapterRatedWatts = 100
         adapterVoltage = 20
         adapterCurrent = 5
+        systemInputVoltage = 19.3
+        systemInputCurrent = 2.59
         adapterName = "USB-C 电源适配器"
         adapterInputWatts = 50
         systemLoadWatts = 31.6
@@ -896,13 +903,25 @@ final class PowerMonitor: ObservableObject {
         batteryPresent = snapshot.isPresent
         batteryLevel = snapshot.isPresent ? snapshot.level : -1
         let smcBatteryPower = smcPower(smc, "PPBR")
+        let measuredPackCharge = snapshot.batteryVoltage
+            * max(0, snapshot.batteryCurrent)
+        let hasBatteryChargeEvidence =
+            PowerMetricsCore.hasCorroboratedChargingPower(
+                telemetrySystemPowerInWatts: snapshot.systemInputWatts,
+                telemetrySystemLoadWatts: snapshot.systemLoadWatts,
+                telemetryBatteryPowerWatts:
+                    snapshot.hasTelemetryBatteryPower
+                        ? snapshot.telemetryBatteryPowerWatts
+                        : nil,
+                positivePackPowerWatts: measuredPackCharge
+            )
         let smcChargingSignal = smcReadings["CHCC"]?.status == .available
             && (smc["CHCC"] ?? 0).isFinite
             && (smc["CHCC"] ?? 0) > 0.001
             // CHCC can retain a small nonzero value while charging is paused.
-            // Require a meaningful live battery rail when CHCC is the only
-            // signal; explicit IOPS/IORegistry charging remains authoritative.
-            && smcBatteryPower >= 2
+            // PPBR is a discharge rail on this hardware, so corroborate CHCC
+            // with the signed telemetry or whole-pack voltage × current.
+            && hasBatteryChargeEvidence
         isCharging = snapshot.isPresent
             && (snapshot.isCharging
                 || (snapshot.isOnAC
@@ -947,21 +966,20 @@ final class PowerMonitor: ObservableObject {
         adapterRatedWatts = nonnegativePower(snapshot.adapterRatedWatts)
         adapterVoltage = max(0, snapshot.adapterVoltage)
         adapterCurrent = max(0, snapshot.adapterCurrent)
+        systemInputVoltage = max(0, snapshot.systemInputVoltage)
+        systemInputCurrent = max(0, snapshot.systemInputCurrent)
         adapterName = snapshot.adapterName
         adapterEfficiencyLossWatts = nonnegativePower(snapshot.adapterEfficiencyLossWatts)
         externalPowerOutWatts = nonnegativePower(snapshot.externalPowerOutWatts)
         batteryVoltage = max(0, snapshot.batteryVoltage)
         batteryCurrent = snapshot.batteryCurrent
 
-        // PPBR is the live battery rail on Apple Silicon. The IORegistry
-        // BatteryPower value can remain stale after the charging direction
-        // changes, so keep the registry figure as the fallback.
+        // PPBR describes battery discharge on this hardware. It must not
+        // replace the whole-pack charge value while energy is flowing into the
+        // battery; the live PDTR/PSTR balance is applied in updatePowerFlow.
         let measuredBatteryFlow: Double
         if isCharging {
-            measuredBatteryFlow = firstPositive(
-                smcBatteryPower,
-                snapshot.batteryFlowWatts
-            )
+            measuredBatteryFlow = firstPositive(snapshot.batteryFlowWatts)
         } else if !isOnAC {
             measuredBatteryFlow = firstPositive(
                 smcBatteryPower,
@@ -1079,33 +1097,79 @@ final class PowerMonitor: ObservableObject {
         smc: [String: Double]
     ) {
         let smcAdapter = smcPower(smc, "PDTR")
-        adapterInputWatts = firstPositive(
-            smcAdapter,
-            battery.systemInputWatts
+        let smcSystem = smcPower(smc, "PSTR")
+        let chargingBalance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: smcAdapter,
+            smcPSTRWatts: smcSystem,
+            smcPPBRWatts: smcPower(smc, "PPBR"),
+            telemetrySystemPowerInWatts: battery.systemInputWatts,
+            telemetrySystemLoadWatts: battery.systemLoadWatts,
+            telemetryBatteryPowerWatts: battery.hasTelemetryBatteryPower
+                ? battery.telemetryBatteryPowerWatts
+                : nil,
+            packBatteryChargeWatts: battery.packBatteryChargeWatts
         )
 
-        let smcSystem = smcPower(smc, "PSTR")
-        let balanceEstimate: Double
-        if isOnAC {
-            switch batteryFlowDirection {
-            case .charging:
-                balanceEstimate = adapterInputWatts - batteryFlowWatts
-            case .supplying:
-                balanceEstimate = adapterInputWatts + batteryFlowWatts
-            case .idle, .unknown, .unavailable:
-                balanceEstimate = adapterInputWatts
-            }
+        let now = Date()
+        let coherentChargingBalance: ChargingPowerBalance?
+        if chargingBalance.source != .unavailable {
+            lastChargingPowerBalance = chargingBalance
+            lastChargingPowerBalanceDate = now
+            coherentChargingBalance = chargingBalance
+        } else if let previous = lastChargingPowerBalance,
+                  now.timeIntervalSince(lastChargingPowerBalanceDate) >= 0,
+                  now.timeIntervalSince(lastChargingPowerBalanceDate)
+                    <= chargingBalanceFreshness {
+            coherentChargingBalance = previous
         } else {
-            balanceEstimate = batteryFlowWatts
+            coherentChargingBalance = nil
         }
 
-        let measuredSystemLoad = firstPositive(
-            smcSystem,
-            battery.systemLoadWatts,
-            processor.systemPower
-        )
-        systemLoadIsEstimated = measuredSystemLoad == 0 && balanceEstimate > 0
-        systemLoadWatts = firstPositive(measuredSystemLoad, balanceEstimate)
+        if isOnAC, isCharging {
+            // Apply all three values from one resolver. Never combine a live
+            // adapter value with a stale battery value: the diagram must keep
+            // input = system load + battery charge on every rendered frame.
+            adapterInputWatts = coherentChargingBalance?.adapterInputWatts ?? 0
+            systemLoadWatts = coherentChargingBalance?.systemLoadWatts ?? 0
+            batteryFlowWatts = coherentChargingBalance?.batteryChargeWatts ?? 0
+            batteryFlowDirection = .charging
+            systemLoadIsEstimated = coherentChargingBalance == nil
+                || coherentChargingBalance?.source == .adapterAndBattery
+                || coherentChargingBalance?.source == .systemAndBattery
+        } else {
+            lastChargingPowerBalance = nil
+            lastChargingPowerBalanceDate = .distantPast
+            adapterInputWatts = firstPositive(
+                smcAdapter,
+                battery.systemInputWatts
+            )
+
+            let balanceEstimate: Double
+            if isOnAC {
+                switch batteryFlowDirection {
+                case .charging:
+                    balanceEstimate = adapterInputWatts - batteryFlowWatts
+                case .supplying:
+                    balanceEstimate = adapterInputWatts + batteryFlowWatts
+                case .idle, .unknown, .unavailable:
+                    balanceEstimate = adapterInputWatts
+                }
+            } else {
+                balanceEstimate = batteryFlowWatts
+            }
+
+            let measuredSystemLoad = firstPositive(
+                smcSystem,
+                battery.systemLoadWatts,
+                processor.systemPower
+            )
+            systemLoadIsEstimated = measuredSystemLoad == 0
+                && balanceEstimate > 0
+            systemLoadWatts = firstPositive(
+                measuredSystemLoad,
+                balanceEstimate
+            )
+        }
 
         // PBwo is used by newer Apple Silicon systems; PDBR is present on
         // several M1–M4 MacBook Pro models.
