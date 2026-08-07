@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.5.3 — 2026-08-07
+
+- Fixed charging power being understated because AppleSMC `PPBR` was
+  incorrectly treated as a bidirectional battery-flow magnitude; `PPBR` is now
+  used only for battery discharge.
+- Kept adapter input, system load and battery charge from the same
+  `PowerTelemetryData` sample together, so the energy-flow diagram preserves
+  `adapter input = system load + battery charge` instead of mixing asynchronous
+  readings.
+- Added AppleSMC `PDTR - PSTR` as the live fallback, cross-checked it against
+  independent whole-pack power, derived a missing third leg from the remaining
+  two values, and briefly retained the last coherent tuple across partial frames.
+- Limited `CHCC` to corroborating charging state rather than supplying battery
+  watts, while retaining public power-source and IORegistry state as the
+  authoritative direction signals.
+- Separated the adapter's real-time input voltage, current and power from its
+  negotiated voltage/current ceiling, and labeled the latter as a negotiated
+  maximum rather than live consumption.
+
 ## 1.5.2 — 2026-08-06
 
 - Reconciled raw AppleSmartBattery flags with the public IOPowerSources state,

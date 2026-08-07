@@ -304,7 +304,7 @@ struct EnergyFlowView: View {
             }
 
             metricRow(
-                "适配器输入",
+                "适配器供电",
                 symbol: "powerplug.fill",
                 value: watts(model.adapterInputWatts),
                 detail: model.adapterRatedWatts > 0
@@ -312,13 +312,13 @@ struct EnergyFlowView: View {
                     : nil
             )
             metricRow(
-                "适配器电气",
+                "Mac 实时输入",
                 symbol: "bolt.horizontal.fill",
                 value: electrical(
-                    voltage: model.adapterVoltage,
-                    current: model.adapterCurrent
+                    voltage: model.systemInputVoltage,
+                    current: model.systemInputCurrent
                 ),
-                detail: model.adapterName.isEmpty ? nil : model.adapterName
+                detail: adapterContractText
             )
             metricRow(
                 "转换损耗 / 对外供电",
@@ -776,6 +776,22 @@ struct EnergyFlowView: View {
             return "\(model.fanRPM) RPM"
         }
         return "—"
+    }
+
+    private var adapterContractText: String? {
+        guard model.adapterVoltage > 0 else {
+            return model.adapterName.isEmpty ? nil : model.adapterName
+        }
+        let contract = model.adapterCurrent > 0
+            ? String(
+                format: "协商上限 %.1f V · %.2f A",
+                model.adapterVoltage,
+                model.adapterCurrent
+            )
+            : String(format: "协商上限 %.1f V", model.adapterVoltage)
+        return model.adapterName.isEmpty
+            ? contract
+            : "\(model.adapterName) · \(contract)"
     }
 
     private var otherModelNote: String {
@@ -1510,7 +1526,7 @@ private struct SculptedPowerFlow: View {
     private var accessibilitySummary: String {
         [
             isOnAC
-                ? "适配器输入 \(watt(sourcePower))"
+                ? "适配器供电 \(watt(sourcePower))"
                 : "电池输出 \(watt(sourcePower))",
             isOnAC
                 ? "电池功率 \(watt(batteryPower, allowZero: true))"

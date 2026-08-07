@@ -285,6 +285,170 @@ final class PowerMetricsCoreTests: XCTestCase {
         XCTAssertEqual(allocation.gpuWatts, 3, accuracy: 0.000_001)
     }
 
+    func testChargingBalanceUsesDynamicPDTRMinusPSTRInsteadOfPPBR() {
+        let balance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: 66.73,
+            smcPSTRWatts: 44.98,
+            smcPPBRWatts: 0.94,
+            telemetrySystemPowerInWatts: nil,
+            telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil,
+            packBatteryChargeWatts: nil
+        )
+
+        XCTAssertEqual(balance.source, .smcPDTRPSTR)
+        XCTAssertEqual(balance.adapterInputWatts, 66.73, accuracy: 0.000_001)
+        XCTAssertEqual(balance.systemLoadWatts, 44.98, accuracy: 0.000_001)
+        XCTAssertEqual(balance.batteryChargeWatts, 21.75, accuracy: 0.000_001)
+        XCTAssertEqual(
+            balance.adapterInputWatts,
+            balance.systemLoadWatts + balance.batteryChargeWatts,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testChargingBalancePrefersAtomicTelemetryWhenSMCAlsoReconciles() {
+        let balance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: 66.73,
+            smcPSTRWatts: 44.98,
+            smcPPBRWatts: 0.94,
+            telemetrySystemPowerInWatts: 64.245,
+            telemetrySystemLoadWatts: 35.513,
+            telemetryBatteryPowerWatts: 28.732,
+            packBatteryChargeWatts: 28.4
+        )
+
+        XCTAssertEqual(balance.source, .powerTelemetry)
+        XCTAssertEqual(balance.adapterInputWatts, 64.245, accuracy: 0.000_001)
+        XCTAssertEqual(balance.systemLoadWatts, 35.513, accuracy: 0.000_001)
+        XCTAssertEqual(balance.batteryChargeWatts, 28.732, accuracy: 0.000_001)
+    }
+
+    func testChargingBalanceKeepsAtomicTelemetryTupleTogether() {
+        let balance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: nil,
+            smcPSTRWatts: nil,
+            smcPPBRWatts: 0.97,
+            telemetrySystemPowerInWatts: 84.481,
+            telemetrySystemLoadWatts: 61.814,
+            telemetryBatteryPowerWatts: 22.667,
+            packBatteryChargeWatts: 22.2
+        )
+
+        XCTAssertEqual(balance.source, .powerTelemetry)
+        XCTAssertEqual(balance.adapterInputWatts, 84.481, accuracy: 0.000_001)
+        XCTAssertEqual(balance.systemLoadWatts, 61.814, accuracy: 0.000_001)
+        XCTAssertEqual(balance.batteryChargeWatts, 22.667, accuracy: 0.000_001)
+    }
+
+    func testChargingBalanceRejectsGrosslyLaggingSMCResidualWithPackPower() {
+        let balance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: 90,
+            smcPSTRWatts: 20,
+            smcPPBRWatts: 1,
+            telemetrySystemPowerInWatts: nil,
+            telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil,
+            packBatteryChargeWatts: 19.260
+        )
+
+        XCTAssertEqual(balance.source, .adapterAndBattery)
+        XCTAssertEqual(balance.adapterInputWatts, 90, accuracy: 0.000_001)
+        XCTAssertEqual(balance.systemLoadWatts, 70.740, accuracy: 0.000_001)
+        XCTAssertEqual(balance.batteryChargeWatts, 19.260, accuracy: 0.000_001)
+    }
+
+    func testChargingBalanceDerivesMissingSystemLegFromPackPower() {
+        let balance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: 80.376,
+            smcPSTRWatts: nil,
+            smcPPBRWatts: 0.95,
+            telemetrySystemPowerInWatts: nil,
+            telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil,
+            packBatteryChargeWatts: 19.260
+        )
+
+        XCTAssertEqual(balance.source, .adapterAndBattery)
+        XCTAssertEqual(balance.systemLoadWatts, 61.116, accuracy: 0.000_001)
+        XCTAssertEqual(
+            balance.adapterInputWatts,
+            balance.systemLoadWatts + balance.batteryChargeWatts,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testChargingBalanceDerivesMissingAdapterLegFromPackPower() {
+        let balance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: nil,
+            smcPSTRWatts: 61.116,
+            smcPPBRWatts: 0.95,
+            telemetrySystemPowerInWatts: nil,
+            telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil,
+            packBatteryChargeWatts: 19.260
+        )
+
+        XCTAssertEqual(balance.source, .systemAndBattery)
+        XCTAssertEqual(balance.adapterInputWatts, 80.376, accuracy: 0.000_001)
+        XCTAssertEqual(balance.systemLoadWatts, 61.116, accuracy: 0.000_001)
+    }
+
+    func testChargingBalanceDoesNotInventPowerFromPPBRAlone() {
+        let balance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: nil,
+            smcPSTRWatts: nil,
+            smcPPBRWatts: 5,
+            telemetrySystemPowerInWatts: nil,
+            telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil,
+            packBatteryChargeWatts: nil
+        )
+
+        XCTAssertEqual(balance.source, .unavailable)
+        XCTAssertEqual(balance.adapterInputWatts, 0)
+        XCTAssertEqual(balance.systemLoadWatts, 0)
+        XCTAssertEqual(balance.batteryChargeWatts, 0)
+    }
+
+    func testChargingBalanceRejectsNonFinitePartialSamples() {
+        let balance = PowerMetricsCore.resolveChargingPowerBalance(
+            smcPDTRWatts: .nan,
+            smcPSTRWatts: .infinity,
+            smcPPBRWatts: 4,
+            telemetrySystemPowerInWatts: nil,
+            telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil,
+            packBatteryChargeWatts: nil
+        )
+
+        XCTAssertEqual(balance.source, .unavailable)
+    }
+
+    func testChargingEvidenceRejectsStaleUnbalancedTelemetry() {
+        XCTAssertFalse(PowerMetricsCore.hasCorroboratedChargingPower(
+            telemetrySystemPowerInWatts: 80,
+            telemetrySystemLoadWatts: 61,
+            telemetryBatteryPowerWatts: 4,
+            positivePackPowerWatts: 0
+        ))
+    }
+
+    func testChargingEvidenceAcceptsBalancedTelemetryOrPositivePackPower() {
+        XCTAssertTrue(PowerMetricsCore.hasCorroboratedChargingPower(
+            telemetrySystemPowerInWatts: 80,
+            telemetrySystemLoadWatts: 61,
+            telemetryBatteryPowerWatts: 19,
+            positivePackPowerWatts: 0
+        ))
+        XCTAssertTrue(PowerMetricsCore.hasCorroboratedChargingPower(
+            telemetrySystemPowerInWatts: nil,
+            telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil,
+            positivePackPowerWatts: 7.5
+        ))
+    }
+
     func testIOPowerSourcesChargingSignalIsAccepted() {
         let state = BatteryStateCore.resolve(batterySignals(
             powerSourcesIsCharging: true,

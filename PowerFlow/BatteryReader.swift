@@ -26,6 +26,12 @@ nonisolated struct BatterySnapshot: Sendable {
     var batteryCurrent = 0.0
     var systemLoadWatts = 0.0
     var systemInputWatts = 0.0
+    var telemetryBatteryPowerWatts = 0.0
+    var hasTelemetryBatteryPower = false
+    var hasPowerTelemetryBalance = false
+    var packBatteryChargeWatts = 0.0
+    var systemInputVoltage = 0.0
+    var systemInputCurrent = 0.0
     var adapterEfficiencyLossWatts = 0.0
     var externalPowerOutWatts = 0.0
 
@@ -157,11 +163,41 @@ enum BatteryReader {
             ?? string(adapter["Description"])
             ?? ""
 
-        result.systemInputWatts = number(telemetry["SystemPowerIn"]) / 1000.0
-        result.systemLoadWatts = number(telemetry["SystemLoad"]) / 1000.0
+        let telemetrySystemInputMW = numberValue(telemetry["SystemPowerIn"])
+        let telemetrySystemLoadMW = numberValue(telemetry["SystemLoad"])
+        result.systemInputWatts = saneWholeSystemPower(
+            (telemetrySystemInputMW ?? 0) / 1000.0
+        )
+        result.systemLoadWatts = saneWholeSystemPower(
+            (telemetrySystemLoadMW ?? 0) / 1000.0
+        )
+        result.systemInputVoltage = number(telemetry["SystemVoltageIn"]) / 1000.0
+        result.systemInputCurrent = number(telemetry["SystemCurrentIn"]) / 1000.0
         result.adapterEfficiencyLossWatts = number(telemetry["AdapterEfficiencyLoss"]) / 1000.0
 
         let telemetryBatteryMW = signedNumber(telemetry["BatteryPower"])
+        let signedTelemetryPowerWatts = (telemetryBatteryMW ?? 0) / 1000.0
+        if telemetryBatteryMW != nil,
+           signedTelemetryPowerWatts.isFinite,
+           abs(signedTelemetryPowerWatts) < 200 {
+            result.telemetryBatteryPowerWatts = signedTelemetryPowerWatts
+            result.hasTelemetryBatteryPower = true
+        }
+        let telemetryResidual = result.systemInputWatts
+            - result.systemLoadWatts
+        let telemetryTolerance = max(
+            0.25,
+            result.systemInputWatts * 0.02
+        )
+        result.hasPowerTelemetryBalance =
+            telemetrySystemInputMW != nil
+                && telemetrySystemLoadMW != nil
+                && result.hasTelemetryBatteryPower
+                && result.systemInputWatts > 0.02
+                && result.systemInputWatts >= result.systemLoadWatts
+                && abs(
+                    telemetryResidual - result.telemetryBatteryPowerWatts
+                ) <= telemetryTolerance
         let rawBatteryVoltage = Double(firstInt("Voltage"))
         let rawBatteryCurrent = Double(
             signedInt(property("InstantAmperage"))
@@ -176,8 +212,18 @@ enum BatteryReader {
             rawBatteryVoltage * rawBatteryCurrent / 1_000_000.0
         )
         let telemetryPowerWatts = saneBatteryPower(
-            telemetryBatteryMW / 1_000.0
+            (telemetryBatteryMW ?? 0) / 1_000.0
         )
+        let packBatteryPowerWatts = firstPositive(
+            gaugePowerWatts,
+            saneBatteryPower(
+                rawBatteryVoltage * chargingCurrent / 1_000_000.0
+            ),
+            saneBatteryPower(
+                chargingVoltage * chargingCurrent / 1_000_000.0
+            )
+        )
+        result.packBatteryChargeWatts = packBatteryPowerWatts
         let resolvedState = BatteryStateCore.resolve(
             BatteryStateSignals(
                 registryIsCharging: bool(property("IsCharging")) ?? false,
@@ -201,19 +247,13 @@ enum BatteryReader {
 
         if result.isCharging {
             result.batteryFlowWatts = firstPositive(
-                gaugePowerWatts,
-                telemetryPowerWatts,
-                saneBatteryPower(
-                    rawBatteryVoltage * chargingCurrent / 1_000_000.0
-                ),
-                saneBatteryPower(
-                    chargingVoltage * chargingCurrent / 1_000_000.0
-                )
+                result.hasPowerTelemetryBalance ? telemetryPowerWatts : 0,
+                packBatteryPowerWatts
             )
         } else if !result.isOnAC {
             result.batteryFlowWatts = firstPositive(
-                gaugePowerWatts,
-                telemetryPowerWatts
+                telemetryPowerWatts,
+                gaugePowerWatts
             )
         } else {
             result.batteryFlowWatts = 0
@@ -295,6 +335,12 @@ enum BatteryReader {
         return magnitude.isFinite && magnitude < 200 ? magnitude : 0
     }
 
+    nonisolated private static func saneWholeSystemPower(
+        _ value: Double
+    ) -> Double {
+        value.isFinite && value >= 0 && value < 1_000 ? value : 0
+    }
+
     nonisolated private static func readExternalPower(_ value: Any?) -> Double {
         let entries: [[String: Any]]
         if let array = value as? [[String: Any]] {
@@ -332,11 +378,18 @@ enum BatteryReader {
         return 0
     }
 
-    nonisolated private static func signedNumber(_ value: Any?) -> Double {
+    nonisolated private static func numberValue(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        return nil
+    }
+
+    nonisolated private static func signedNumber(_ value: Any?) -> Double? {
         if let number = value as? NSNumber { return Double(number.int64Value) }
         if let value = value as? Int64 { return Double(value) }
         if let value = value as? Int { return Double(value) }
-        return 0
+        return nil
     }
 
     nonisolated private static func bool(_ value: Any?) -> Bool? {

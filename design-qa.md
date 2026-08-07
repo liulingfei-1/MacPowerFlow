@@ -1,13 +1,13 @@
-# MacPowerFlow 1.5.2 设计与发布 QA
+# MacPowerFlow 1.5.3 设计与发布 QA
 
 ## 验收对象
 
 - 视觉参考：用户提供的能量流截图。
-- 最终包：`dist/MacPowerFlow-1.5.2.zip`。
-- 版本：`MacPowerFlow 1.5.2 (14)`，Apple Silicon `arm64`。
-- 压缩包大小：`1,311,136 bytes`。
+- 最终包：`dist/MacPowerFlow-1.5.3.zip`。
+- 版本：`MacPowerFlow 1.5.3 (15)`，Apple Silicon `arm64`。
+- 压缩包大小：`1,314,674 bytes`。
 - SHA-256：
-  `a28c54f7bd4f5945108b26a28e7f88ebb684b1a172be68a95fc88f1fb7f56fa9`。
+  `69a0b6c0d98c8377bfcdb779fc938c8fc28aba06ceeb65102c08fe607ee4c377`。
 - 面板基准宽度：`420 pt`，深色外观。
 
 ## 关于面板与开源披露
@@ -40,7 +40,8 @@
 ## 六组连续真实采样
 
 1.5.0 在同一台真实硬件上的 6 组连续刷新保留为布局与功耗守恒基线；
-1.5.1 没有改动流道或文字布局，1.5.2 只重做独立电池支路：
+1.5.1 没有改动流道或文字布局，1.5.2 重做独立电池支路，1.5.3
+只调整充电数据的守恒解析与电源字段标签：
 
 | 采样 | 整机 | CPU | GPU | 显示 | 其他 |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -77,22 +78,33 @@
 - “其他”仍由整机功耗扣除 CPU、GPU 和显示后取非负残差；最终 6 组连续采样
   均未再出现 GPU 瞬时值大于整机、导致 CPU 被挤为零的不可能流图。
 
-## 充电状态与电池方向
+## 充电状态、电池方向与功率守恒
 
 - 状态解析同时读取公开 IOPowerSources、`IsCharging`、
   `AppleRawExternalConnected`、充电器活动和已知 SMC `CHCC`；外接电源变化
   会触发立即刷新，不再只等待两秒轮询。
-- 电池功率优先使用实时 SMC `PPBR` 幅值；方向由系统充电/供电状态决定，
-  不把不同电池控制器上可能包装方式不同的电流正负号当跨机型真值。
+- 充电时优先使用同一 `PowerTelemetryData` 样本中的 `SystemPowerIn`、
+  `SystemLoad`、`BatteryPower` 三元组；只有三者能在 2% / 0.25 W 容差内
+  对账时才把它当完整原子样本。`PPBR` 在本机是放电轨，充电时不再使用。
+- 完整遥测缺失时使用 AppleSMC `PDTR - PSTR`；如果它与独立整包电压 × 电流
+  相差超过 `max(3 W, 35%)`，则保留实时输入腿、用整包功率重新推导系统腿。
+  再缺一腿时也只由剩余两项推导第三项，不会重新混合三个异步来源。
+- 某一刷新周期完全得不到两项可信值时，最多沿用 6 秒内上一份完整三元组；
+  过期后整组归零。AC 充电路径因此始终满足
+  `适配器供电 = 系统负载 + 电池充入`。
+- 2026-08-07 本机实际充电样本为 `35.420 = 31.006 + 4.414 W`；同一时刻
+  SMC `PDTR / PSTR / PPBR` 为 `36.281 / 32.059 / 0.951 W`，再次验证
+  `PPBR` 不能代表整包充电功率。
 - 固定充电预览使用 `62%`、适配器 `50.0 W`、整机 `31.6 W`、充入
   `18.4 W`；顶部电池条、状态标签和能量流均显示“正在充电”，绿色箭头明确
   指向电池，所有文字均在节点内且无重叠。
 - 实机满电状态为 IOPowerSources `100% / Is Charging = false / Is Charged = true`；
   面板显示“已充满”、电池功率 `0.0 W`，支路降为细中性连接。该检查同时发现并
   修正了满电时 `CHCC` 非零残留造成的误报。
-- 新增 6 个纯状态回归用例，覆盖 IOPowerSources 回退、原始 AC 标志、陈旧满电
-  标志、无功率佐证的充电电流、已佐证的充电电流与满电抑制；独立 smoke harness
-  全部通过，Swift 6 全应用 typecheck 通过。
+- 在原有纯状态用例基础上新增 10 个功率守恒回归用例，覆盖完整遥测优先、
+  `PDTR - PSTR`、错相纠偏、缺腿推导、`PPBR` 排除、NaN / Infinity、CHCC
+  双滞后抑制和正向整包佐证；当前测试源码共 34 个用例，6 场景独立 smoke
+  harness 全部通过，Swift 6 全应用 typecheck 通过。
 
 ## CPU 零值与部分帧回归
 
@@ -142,17 +154,17 @@
 
 ## 构建、签名与安装验证
 
-- Swift 6 全应用 typecheck、三个 Core 源 typecheck，以及当前源码的 Release
+- Swift 6 全应用 typecheck、Core 源 typecheck，以及当前源码的 Release
   `arm64` 编译和链接均通过。本机当前只选择了 Command Line Tools，没有完整
   Xcode 的 `XCTest.framework`，因此本轮没有把 `swift test` 记作重新通过；测试源
-  保留 24 个用例，新增 6 个电池状态用例另由独立 smoke harness 全部通过。
+  保留 34 个用例，本次充电守恒关键路径另由 6 场景独立 smoke harness 全部通过。
 - 使用与发布脚本相同的独立暂存、签名和压缩步骤生成最终 ZIP 后重新解包验证；
   helper、installer 和外层 App 均通过
   `codesign --verify --strict`，解包后没有额外扩展属性输出。
 - 发布暂存先从 Git 对象库恢复未修改的跟踪文件，再叠加当前差异和非忽略新文件；
   即使 Documents/File Provider 把未修改图标或许可证逐出为 `dataless`，也不会卡住构建。
 - 解包后的主程序为 Mach-O 64-bit `arm64`，`CFBundleShortVersionString` 与
-  `CFBundleVersion` 分别为 `1.5.2` 和 `14`。
+  `CFBundleVersion` 分别为 `1.5.3` 和 `15`。
 - 最终应用使用固定 `/Applications/MacPowerFlow.app` 路径验证；旧版本在替换前移入
   `.build/previous-releases/`，没有直接删除用户副本。
 - 1.5.2 先行构建（CDHash
@@ -160,16 +172,18 @@
   root helper、单一 `powermetrics` 子进程和 `root:wheel 0444` 的精确客户端
   要求配置均正常，且没有再次出现 `SecurityAgent`。这验证了同一二进制批准后
   重开应用免输密码的链路。
-- 最终安装包在加入 `CHCC + PPBR` 满电残留约束后重新构建，已安装 App 的 CDHash
-  为 `6fa4ea7239fe073ead5453a95cfd21cfea38a684`。因为安全配置精确绑定二进制，
-  用户首次打开这个最终包时还需批准一次；之后同一包的日常启动和系统重启不再
-  输入密码。最终 CDHash 的批准后重启检查不会在用户完成系统认证前宣称通过。
+- 最终 1.5.3 App 的 CDHash 为
+  `28609c5704dc15f7f6cf7a76a7e8e2b6bcecd90f`，已安装到
+  `/Applications/MacPowerFlow.app`；旧 1.5.2 完整保存在
+  `.build/previous-releases/`。因为安全配置精确绑定二进制，首次打开 1.5.3
+  仍需批准一次；之后同一包的日常启动和系统重启不再输入密码。批准后的增强
+  重启检查不会在用户完成系统认证前宣称通过。
 
 ## 发布限制
 
-当前包使用 hardened ad-hoc 签名，helper 通过精确 CDHash 绑定已安装的 1.5.2 App。
+当前包使用 hardened ad-hoc 签名，helper 通过精确 CDHash 绑定已安装的 1.5.3 App。
 同一个二进制在日常重启和 Mac 重启后不需再次输入密码；以后重建或升级 App 会
 改变 CDHash，因此需要对新二进制批准一次。要在跨版本升级后继续保持稳定身份，
 仍需 Developer ID Application 签名、公证与基于 `SMAppService` 的 LaunchDaemon。
 
-final result: charging logic, visual states, build, signing, archive verification, and installation passed; one-time approval and post-approval restart verification remain for the exact final CDHash
+final result: coherent charging balance, visual states, build, signing, archive verification, and installation passed; one-time approval and post-approval restart verification remain for the exact final CDHash
