@@ -20,7 +20,7 @@ enum MPFPrivilegedService {
     static let embeddedInstallerExecutableName =
         "com.llf.MacPowerFlow.PrivilegedInstaller"
     static let protocolVersion = 1
-    static let helperVersion = "1.5.0"
+    static let helperVersion = "1.5.2"
     static let retryableSessionBusyMarker = "MPF_RETRY_SESSION_BUSY"
 
     static let installedHelperPath =
@@ -56,7 +56,7 @@ enum MPFPrivilegedService {
         "--format",
         "plist",
         "--buffer-size",
-        "1",
+        "0",
         "--poweravg",
         "0",
         "--handle-invalid-values",

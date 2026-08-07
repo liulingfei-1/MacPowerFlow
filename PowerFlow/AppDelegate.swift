@@ -24,10 +24,15 @@ final class AppDelegate: NSObject,
     private var isPreviewMode: Bool {
         ProcessInfo.processInfo.arguments.contains("--preview")
             || isChargingPreview
+            || isAboutPreview
     }
 
     private var isChargingPreview: Bool {
         ProcessInfo.processInfo.arguments.contains("--preview-charging")
+    }
+
+    private var isAboutPreview: Bool {
+        ProcessInfo.processInfo.arguments.contains("--preview-about")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -42,12 +47,18 @@ final class AppDelegate: NSObject,
         configureContextMenu()
         observeModel()
 
-        model.startMonitoring(
-            automaticallyStartAdministrator: !isPreviewMode
-        )
+        if isChargingPreview {
+            model.installChargingPreview()
+        } else {
+            model.startMonitoring(
+                automaticallyStartAdministrator: !isPreviewMode
+            )
+        }
         updateStatusItem()
 
-        if isPreviewMode {
+        if isAboutPreview {
+            showAbout(nil)
+        } else if isPreviewMode {
             showPreviewWindow()
         }
     }
@@ -205,8 +216,23 @@ final class AppDelegate: NSObject,
         } else {
             source = "外接电源"
         }
-        let charging = displayedIsCharging ? "，正在充电" : ""
-        button.toolTip = "\(source)\(charging) · 系统负载 \(loadText)"
+        let batteryState: String
+        if displayedIsCharging {
+            batteryState = model.batteryFlowWatts > 0.02
+                ? "，正在充电 · 充入 \(Self.formatWatts(model.batteryFlowWatts))"
+                : "，正在充电"
+        } else if model.isFullyCharged {
+            batteryState = "，已充满"
+        } else if model.batteryPresent && model.isOnAC {
+            batteryState = "，已接电源但未充电"
+        } else if model.batteryPresent {
+            batteryState = model.batteryFlowWatts > 0.02
+                ? "，电池输出 \(Self.formatWatts(model.batteryFlowWatts))"
+                : "，正在使用电池"
+        } else {
+            batteryState = ""
+        }
+        button.toolTip = "\(source)\(batteryState) · 系统负载 \(loadText)"
         let batteryAccessibility: String
         if !hasSample {
             batteryAccessibility = ""
@@ -216,7 +242,7 @@ final class AppDelegate: NSObject,
             batteryAccessibility = "无内置电池，"
         }
         button.setAccessibilityValue(
-            "\(batteryAccessibility)\(source)\(charging)，系统负载 \(loadText)"
+            "\(batteryAccessibility)\(source)\(batteryState)，系统负载 \(loadText)"
         )
     }
 
@@ -690,7 +716,9 @@ final class AppDelegate: NSObject,
     @objc
     private func showAbout(_ sender: Any?) {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.orderFrontStandardAboutPanel(nil)
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .credits: AboutCredits.make(),
+        ])
     }
 
     @objc

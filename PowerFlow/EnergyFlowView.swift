@@ -125,6 +125,9 @@ struct EnergyFlowView: View {
                     Text(batteryRailDetail)
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(Color.white.opacity(0.76))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                        .allowsTightening(true)
                 }
                 .padding(.horizontal, 13)
             }
@@ -143,6 +146,7 @@ struct EnergyFlowView: View {
         SculptedPowerFlow(
             isOnAC: model.isOnAC,
             batteryPresent: model.batteryPresent,
+            isFullyCharged: model.isFullyCharged,
             batteryDirection: model.batteryFlowDirection,
             sourcePower: model.isOnAC
                 ? model.adapterInputWatts
@@ -271,9 +275,9 @@ struct EnergyFlowView: View {
                     value: temperature(model.batteryTempC)
                 )
                 metricRow(
-                    model.isFullyCharged
-                        ? "充电状态"
-                        : (model.isCharging ? "预计充满" : "预计可用"),
+                    model.isCharging
+                        ? "预计充满"
+                        : (model.isFullyCharged ? "充电状态" : "预计可用"),
                     symbol: "clock",
                     value: model.batteryTimeText
                 )
@@ -636,9 +640,10 @@ struct EnergyFlowView: View {
     private var chargeStateText: String {
         guard hasSample else { return "采样中" }
         guard model.batteryPresent else { return "无电池" }
-        if model.isFullyCharged { return "已充满" }
         if model.isCharging { return "充电中" }
-        return "未充电"
+        if model.isFullyCharged { return "已充满" }
+        if model.batteryFlowDirection == .supplying { return "放电中" }
+        return model.isOnAC ? "未充电" : "电池供电"
     }
 
     private var chargeStateSymbol: String {
@@ -720,7 +725,7 @@ struct EnergyFlowView: View {
 
     private var batteryRailValue: String {
         guard hasSample else { return "—" }
-        return model.batteryPresent ? "\(max(model.batteryLevel, 0))" : "AC"
+        return model.batteryPresent ? "\(max(model.batteryLevel, 0))%" : "AC"
     }
 
     private var batteryRailSymbol: String {
@@ -731,7 +736,22 @@ struct EnergyFlowView: View {
     private var batteryRailDetail: String {
         guard hasSample else { return "正在读取传感器" }
         guard model.batteryPresent else { return "无内置电池" }
-        return model.batteryTimeText
+        switch model.batteryFlowDirection {
+        case .charging:
+            return model.batteryFlowWatts > 0.02
+                ? "正在充电 · 充入 \(compactWatts(model.batteryFlowWatts))"
+                : "正在充电"
+        case .supplying:
+            return model.batteryFlowWatts > 0.02
+                ? "电池输出 · \(compactWatts(model.batteryFlowWatts))"
+                : "电池供电"
+        case .idle:
+            return model.isFullyCharged ? "已充满" : "已接电源 · 未充电"
+        case .unknown:
+            return "已接电源 · 未确认电池流动"
+        case .unavailable:
+            return "电池状态不可用"
+        }
     }
 
     private var hasSample: Bool {
@@ -933,6 +953,7 @@ private struct FlowRibbonShape: Shape {
 private struct SculptedPowerFlow: View {
     let isOnAC: Bool
     let batteryPresent: Bool
+    let isFullyCharged: Bool
     let batteryDirection: BatteryFlowDirection
     let sourcePower: Double
     let batteryPower: Double
@@ -980,14 +1001,45 @@ private struct SculptedPowerFlow: View {
 
             ZStack {
                 secondaryLink
-                    .fill(fill)
+                    .fill(secondaryLinkFill)
                     .overlay {
-                        secondaryLink.stroke(stroke, lineWidth: 1)
+                        secondaryLink.stroke(
+                            secondaryLinkStroke,
+                            lineWidth: batteryFlowHasDirection ? 1.2 : 0.8
+                        )
                     }
+                    .opacity(isOnAC && batteryPresent ? 1 : 0)
                     .animation(
                         .easeInOut(duration: 0.35),
                         value: safePower(batteryPower)
                     )
+
+                if isOnAC && batteryPresent && batteryFlowHasDirection {
+                    Image(
+                        systemName: batteryDirection == .charging
+                            ? "arrow.left"
+                            : "arrow.right"
+                    )
+                    .font(.system(size: 7.5, weight: .black))
+                    .foregroundStyle(
+                        batteryDirection == .charging
+                            ? chargingAccent
+                            : text
+                    )
+                    .frame(width: 15, height: 15)
+                    .background(
+                        Circle()
+                            .fill(Color(red: 0.11, green: 0.12, blue: 0.13))
+                            .overlay {
+                                Circle().stroke(secondaryLinkStroke, lineWidth: 1)
+                            }
+                    )
+                    .position(
+                        x: (secondaryLinkStartX + secondaryLinkEndX) / 2,
+                        y: (22 + systemTop + secondaryLinkHeight / 2) / 2
+                    )
+                    .transition(.scale.combined(with: .opacity))
+                }
 
                 ForEach(layouts) { branch in
                     let ribbon = FlowRibbonShape(
@@ -1187,11 +1239,17 @@ private struct SculptedPowerFlow: View {
         let charging = isOnAC
             && batteryPresent
             && batteryDirection == .charging
+        let supplying = isOnAC
+            && batteryPresent
+            && batteryDirection == .supplying
+        let stateColor = charging
+            ? chargingAccent
+            : (supplying ? Color.white.opacity(0.86) : quiet)
 
         return HStack(spacing: 6) {
             Image(systemName: secondarySourceSymbol)
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(charging ? chargingAccent : quiet)
+                .foregroundStyle(stateColor)
 
             Text(secondarySourceText)
                 .font(.system(size: 10, weight: .semibold, design: .rounded))
@@ -1205,11 +1263,17 @@ private struct SculptedPowerFlow: View {
         .frame(width: width, height: height, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: height / 2, style: .continuous)
-                .fill(charging ? chargingAccent.opacity(0.13) : fill)
+                .fill(
+                    charging
+                        ? chargingAccent.opacity(0.13)
+                        : (supplying ? Color.white.opacity(0.08) : fill)
+                )
                 .overlay {
                     RoundedRectangle(cornerRadius: height / 2, style: .continuous)
                         .stroke(
-                            charging ? chargingAccent.opacity(0.42) : stroke,
+                            charging
+                                ? chargingAccent.opacity(0.52)
+                                : (supplying ? Color.white.opacity(0.25) : stroke),
                             lineWidth: 1
                         )
                 }
@@ -1217,6 +1281,7 @@ private struct SculptedPowerFlow: View {
     }
 
     private func secondarySourceLinkHeight() -> CGFloat {
+        guard batteryFlowHasDirection else { return 1.2 }
         let secondaryPower =
             isOnAC && batteryPresent ? safePower(batteryPower) : 0
         let referencePower = max(
@@ -1225,7 +1290,7 @@ private struct SculptedPowerFlow: View {
             safePower(systemPower)
         )
         let ratio = min(1, secondaryPower / referencePower)
-        return 10 + 10 * CGFloat(pow(ratio, 0.55))
+        return 4 + 15 * CGFloat(pow(ratio, 0.55))
     }
 
     private var secondarySourceText: String {
@@ -1235,13 +1300,21 @@ private struct SculptedPowerFlow: View {
         let state: String
         switch batteryDirection {
         case .charging:
-            state = "充电"
+            return batteryPower > 0.02
+                ? "← 充入 \(compactWatt(batteryPower))"
+                : "← 正在充电"
         case .supplying:
-            state = "放电"
-        case .idle, .unknown, .unavailable:
-            state = "待机"
+            return batteryPower > 0.02
+                ? "输出 \(compactWatt(batteryPower)) →"
+                : "电池输出 →"
+        case .idle:
+            state = isFullyCharged ? "已充满" : "未充电"
+        case .unknown:
+            state = "方向待确认"
+        case .unavailable:
+            state = "电池不可用"
         }
-        return "\(state)  \(compactWatt(batteryPower, allowZero: true))"
+        return state
     }
 
     private var secondarySourceSymbol: String {
@@ -1406,6 +1479,32 @@ private struct SculptedPowerFlow: View {
 
     private var batterySymbol: String {
         batteryDirection == .charging ? "battery.100.bolt" : "battery.100"
+    }
+
+    private var batteryFlowHasDirection: Bool {
+        batteryDirection == .charging || batteryDirection == .supplying
+    }
+
+    private var secondaryLinkFill: Color {
+        switch batteryDirection {
+        case .charging:
+            return chargingAccent.opacity(0.42)
+        case .supplying:
+            return Color.white.opacity(0.20)
+        case .idle, .unknown, .unavailable:
+            return Color.white.opacity(0.055)
+        }
+    }
+
+    private var secondaryLinkStroke: Color {
+        switch batteryDirection {
+        case .charging:
+            return chargingAccent.opacity(0.68)
+        case .supplying:
+            return Color.white.opacity(0.30)
+        case .idle, .unknown, .unavailable:
+            return Color.white.opacity(0.10)
+        }
     }
 
     private var accessibilitySummary: String {

@@ -60,7 +60,7 @@ final class PrivilegedPowerSampler {
     private static let maximumBufferBytes = 4 * 1_024 * 1_024
 
     private let runner = MPFPrivilegedMetricsRunner()
-    private var streamBuffer = Data()
+    private var streamDecoder = PowerMetricsFrameDecoder()
     private var wantsSampling = false
     private var parsedSampleCount = 0
     private var pendingTerminalError: String?
@@ -97,7 +97,7 @@ final class PrivilegedPowerSampler {
         parsedSampleCount = 0
         pendingTerminalError = nil
         latestSample = nil
-        streamBuffer.removeAll(keepingCapacity: true)
+        streamDecoder.reset(keepingCapacity: true)
         sampleHandler = onSample
         stateHandler = onStateChange
         startCompletion = completion
@@ -111,7 +111,7 @@ final class PrivilegedPowerSampler {
         wantsSampling = false
         pendingTerminalError = nil
         runner.stop()
-        streamBuffer.removeAll(keepingCapacity: false)
+        streamDecoder.reset(keepingCapacity: false)
     }
 
     /// Cancels the app-session stream and reports a terminal error only after
@@ -125,7 +125,7 @@ final class PrivilegedPowerSampler {
         wantsSampling = false
         pendingTerminalError = message
         runner.stop()
-        streamBuffer.removeAll(keepingCapacity: false)
+        streamDecoder.reset(keepingCapacity: false)
         setState(.stopping)
     }
 
@@ -204,17 +204,15 @@ final class PrivilegedPowerSampler {
     private func consume(_ data: Data) {
         guard wantsSampling else { return }
 
-        streamBuffer.append(data)
-        if streamBuffer.count > Self.maximumBufferBytes {
-            streamBuffer.removeAll(keepingCapacity: false)
+        guard let propertyListFrames = streamDecoder.append(
+            data,
+            maximumFrameBytes: Self.maximumBufferBytes
+        ) else {
             stop(withError: "powermetrics 输出超过安全缓冲区限制。")
             return
         }
 
-        while let delimiter = streamBuffer.firstIndex(of: 0) {
-            let propertyListData = Data(streamBuffer[..<delimiter])
-            streamBuffer.removeSubrange(...delimiter)
-
+        for propertyListData in propertyListFrames {
             guard !propertyListData.isEmpty,
                   let sample = Self.parse(propertyListData) else {
                 continue
@@ -239,7 +237,7 @@ final class PrivilegedPowerSampler {
     }
 
     private func clearSessionCallbacks() {
-        streamBuffer.removeAll(keepingCapacity: false)
+        streamDecoder.reset(keepingCapacity: false)
         sampleHandler = nil
         stateHandler = nil
         startCompletion = nil
@@ -270,17 +268,26 @@ final class PrivilegedPowerSampler {
         let processor = root["processor"] as? [String: Any] ?? [:]
         let processorIsValid = !isInvalid(processor)
 
-        func processorNumber(_ key: String) -> Double? {
-            let nested = processorIsValid ? number(processor[key]) : nil
-            return nested ?? number(root[key])
-        }
-
-        let cpuPower = watts(fromMilliwatts: processorNumber("cpu_power"))
-        let gpuPower = watts(fromMilliwatts: processorNumber("gpu_power"))
-        let anePower = watts(fromMilliwatts: processorNumber("ane_power"))
-        let combinedPower = watts(fromMilliwatts: processorNumber(
-            "combined_power"
-        ))
+        let cpuPower = PowerMetricsCore.resolvedSamplePowerWatts(
+            domain: "cpu",
+            processor: processorIsValid ? processor : [:],
+            root: root
+        )
+        let gpuPower = PowerMetricsCore.resolvedSamplePowerWatts(
+            domain: "gpu",
+            processor: processorIsValid ? processor : [:],
+            root: root
+        )
+        let anePower = PowerMetricsCore.resolvedSamplePowerWatts(
+            domain: "ane",
+            processor: processorIsValid ? processor : [:],
+            root: root
+        )
+        let combinedPower = PowerMetricsCore.resolvedSamplePowerWatts(
+            domain: "combined",
+            processor: processorIsValid ? processor : [:],
+            root: root
+        )
 
         let clusters = processorIsValid
             ? processor["clusters"] as? [[String: Any]] ?? []
@@ -391,11 +398,6 @@ final class PrivilegedPowerSampler {
         guard let value = value as? NSNumber else { return nil }
         let result = value.doubleValue
         return result.isFinite && result >= 0 ? result : nil
-    }
-
-    private static func watts(fromMilliwatts value: Double?) -> Double? {
-        guard let value else { return nil }
-        return value / 1_000
     }
 
     private static func clampedRatio(_ value: Double?) -> Double? {

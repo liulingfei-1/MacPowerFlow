@@ -226,22 +226,34 @@ private final class MetricsCoordinator {
     }
 
     /// powermetrics can spend several seconds establishing its first delta
-    /// baseline on recent macOS releases. SIGINFO is its documented mechanism
-    /// for requesting an immediate sample. A second guarded request covers the
-    /// case where the first signal arrived during process initialization.
+    /// baseline on recent macOS releases. SIGINFO requests an immediate sample,
+    /// while SIGIO flushes any bytes the process still buffered. Several
+    /// guarded requests cover cold launches without disturbing a healthy stream.
     private func requestInitialSamples(
         processIdentifier: pid_t,
         owner: UUID
     ) {
-        for delay in [0.75, 3.5] {
+        for delay in [0.75, 3.5, 10.0, 20.0] {
             queue.asyncAfter(deadline: .now() + delay) {
                 guard self.childProcessIdentifier == processIdentifier,
                       self.ownerIdentifier == owner,
-                      !self.requestedStop,
-                      !self.outputWasObserved else {
+                      !self.requestedStop else {
                     return
                 }
-                _ = Darwin.kill(processIdentifier, SIGINFO)
+                if !self.outputWasObserved {
+                    _ = Darwin.kill(processIdentifier, SIGINFO)
+                }
+
+                // Flush even after the first bytes arrive: observed output can
+                // still be only a partial plist without its NUL delimiter.
+                self.queue.asyncAfter(deadline: .now() + 0.25) {
+                    guard self.childProcessIdentifier == processIdentifier,
+                          self.ownerIdentifier == owner,
+                          !self.requestedStop else {
+                        return
+                    }
+                    _ = Darwin.kill(processIdentifier, SIGIO)
+                }
             }
         }
     }
