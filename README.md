@@ -1,5 +1,11 @@
 # MacPowerFlow
 
+[![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-blue)](https://github.com/liulingfei-1/MacPowerFlow)
+[![Language](https://img.shields.io/badge/language-Swift-orange)](https://swift.org)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/liulingfei-1/MacPowerFlow)](https://github.com/liulingfei-1/MacPowerFlow/releases/latest)
+
+
 MacPowerFlow 是一款面向 Apple Silicon Mac 的轻量级菜单栏功耗监视器。它在同一面板中汇总电源适配器、整机、电池以及 CPU、GPU、神经网络引擎和内存功耗，并用主能量流视图展示电力从哪里进入、又被哪些部分消耗。
 
 ![MacPowerFlow 图标源稿](Design/IconSource.svg)
