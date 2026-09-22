@@ -68,6 +68,67 @@ nonisolated struct SMCCapability: Sendable {
     let isNumeric: Bool
 }
 
+/// Read-only firmware facts. A measured stopped fan is 0 RPM, unavailable is nil.
+nonisolated struct FanSnapshot: Sendable, Identifiable {
+    let id: Int
+    let currentRPM: Double?
+    let minimumRPM: Double?
+    let maximumRPM: Double?
+    let targetRPM: Double?
+    /// 0 automatic / 1 forced, only when this firmware provides a valid mode key.
+    let mode: Int?
+    let modeKey: String?
+    let status: SMCReadingStatus
+}
+
+nonisolated enum FanDiagnostics {
+    static let maximumFanCount = 8
+    static let keys = ["FNum"] + (0..<maximumFanCount).flatMap { index in
+        ["Ac", "Mn", "Mx", "Tg", "md", "Md"].map { "F\(index)\($0)" }
+    }
+
+    static func snapshots(readings: [String: SMCReading]) -> [FanSnapshot]? {
+        func rpm(_ key: String) -> Double? {
+            guard let reading = readings[key], reading.status == .available,
+                  let value = reading.value, value.isFinite, (0...30_000).contains(value) else { return nil }
+            return value
+        }
+        let ids: [Int]
+        if let count = readings["FNum"], count.status == .available,
+           let value = count.value, value.isFinite, value.rounded() == value,
+           (0...Double(maximumFanCount)).contains(value) {
+            ids = Array(0..<Int(value))
+        } else {
+            // Some models omit FNum. Only a successfully read per-fan field
+            // establishes presence; failed/missing keys do not invent fans.
+            ids = (0..<maximumFanCount).filter { index in
+                ["Ac", "Mn", "Mx", "Tg", "md", "Md"].contains {
+                    readings["F\(index)\($0)"]?.status == .available
+                }
+            }
+            if ids.isEmpty { return nil }
+        }
+        return ids.map { index in
+            let prefix = "F\(index)"
+            let current = rpm(prefix + "Ac")
+            let minimum = rpm(prefix + "Mn")
+            let maximum = rpm(prefix + "Mx")
+            let validLimits = minimum == nil || maximum == nil || minimum! <= maximum!
+            let modeKey = [prefix + "md", prefix + "Md"].first { key in
+                guard let reading = readings[key], reading.status == .available,
+                      let value = reading.value else { return false }
+                return value == 0 || value == 1
+            }
+            return FanSnapshot(id: index, currentRPM: current,
+                minimumRPM: validLimits ? minimum : nil, maximumRPM: validLimits ? maximum : nil,
+                targetRPM: rpm(prefix + "Tg"),
+                mode: modeKey.flatMap { readings[$0]?.value }.map(Int.init), modeKey: modeKey,
+                status: current != nil ? .available :
+                    (readings[prefix + "Ac"]?.status == .available ? .failed : readings[prefix + "Ac"]?.status ?? .failed))
+        }
+    }
+}
+
 nonisolated struct HardwareSnapshot: Sendable {
     let battery: BatterySnapshot
     let processor: ProcessorSnapshot
@@ -76,6 +137,8 @@ nonisolated struct HardwareSnapshot: Sendable {
     let smcCapabilities: [String: SMCCapability]
     let smcCapabilityCount: Int
     let smcNumericCapabilityCount: Int
+    /// nil means fan presence could not be determined; [] means confirmed fanless.
+    var fans: [FanSnapshot]? = nil
 }
 
 /// Owns the process-wide IOReport sampling sequence and AppleSMC connection.
@@ -104,7 +167,7 @@ actor HardwareSampler {
         "Tg0P", "Tg1P", "Tg0D", "TG0D",
         "Ta0P", "Ta1P", "Ta0D", "Ta1D",
         "Tm0P", "Tm1P", "Tm0D", "Tm1D"
-    ]
+    ] + FanDiagnostics.keys
 
     func sample() -> HardwareSnapshot {
         if smcConnection == 0 {
@@ -233,7 +296,8 @@ actor HardwareSampler {
             smcReadings: readings,
             smcCapabilities: smcCapabilities,
             smcCapabilityCount: smcCapabilities.count,
-            smcNumericCapabilityCount: smcNumericCapabilityCount
+            smcNumericCapabilityCount: smcNumericCapabilityCount,
+            fans: FanDiagnostics.snapshots(readings: readings)
         )
     }
 

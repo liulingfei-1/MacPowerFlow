@@ -33,12 +33,21 @@ static const char * const MPFSystemInstallPath = "/usr/bin/install";
 static NSTimeInterval const MPFConnectionTimeout = 8.0;
 static NSUInteger const MPFMatchingHelperRetryLimit = 15;
 static NSUInteger const MPFSamplingStartRetryLimit = 16;
-static NSInteger const MPFProtocolVersion = 1;
+static NSInteger const MPFProtocolVersion = 2;
 static NSString * const MPFRetryableSessionBusyMarker =
     @"MPF_RETRY_SESSION_BUSY";
 
-@interface MPFPrivilegedMetricsRunner ()
-    <MPFPrivilegedMetricsClientProtocol> {
+@interface MPFMetricsConnectionReceiver : NSObject <MPFPrivilegedMetricsClientProtocol>
+@property (copy) void (^dataReceived)(NSData *);
+@property (copy) void (^failureReceived)(NSString *);
+@end
+
+@implementation MPFMetricsConnectionReceiver
+- (void)receiveData:(NSData *)data { self.dataReceived(data); }
+- (void)serviceDidFail:(NSString *)message { self.failureReceived(message); }
+@end
+
+@interface MPFPrivilegedMetricsRunner () {
     dispatch_queue_t _workerQueue;
     MPFPrivilegedMetricsRunnerState _state;
     BOOL _workerActive;
@@ -51,11 +60,13 @@ static NSString * const MPFRetryableSessionBusyMarker =
     NSUInteger _connectionFailureCount;
     NSUInteger _matchingHelperRetryCount;
     NSUInteger _samplingStartRetryCount;
+    NSInteger _samplingIntervalSeconds;
     NSXPCConnection *_connection;
     id<MPFPrivilegedMetricsServiceProtocol> _serviceProxy;
     MPFPrivilegedMetricsDataHandler _dataHandler;
     MPFPrivilegedMetricsStateHandler _stateHandler;
 }
+- (id<MPFPrivilegedMetricsClientProtocol>)receiverForGeneration:(NSUInteger)generation;
 @end
 
 @implementation MPFPrivilegedMetricsRunner
@@ -68,6 +79,7 @@ static NSString * const MPFRetryableSessionBusyMarker =
             DISPATCH_QUEUE_SERIAL
         );
         _state = MPFPrivilegedMetricsRunnerStateIdle;
+        _samplingIntervalSeconds = 2;
     }
     return self;
 }
@@ -115,6 +127,82 @@ static NSString * const MPFRetryableSessionBusyMarker =
                 message:nil];
     dispatch_async(_workerQueue, ^{
         [self connectToInstalledHelper];
+    });
+}
+
+- (BOOL)configureSamplingInterval:(NSInteger)seconds {
+    if (seconds != 2 && seconds != 5 && seconds != 10) { return NO; }
+    @synchronized (self) {
+        if (_workerActive) { return NO; }
+        _samplingIntervalSeconds = seconds;
+    }
+    return YES;
+}
+
+- (void)queryLowPowerModeForSource:(NSInteger)source
+    completion:(void (^)(BOOL, BOOL, NSString *))completion {
+    [self performLowPowerOperationForSource:source setting:nil completion:completion];
+}
+
+- (void)setLowPowerModeForSource:(NSInteger)source enabled:(BOOL)enabled
+    completion:(void (^)(BOOL, BOOL, NSString *))completion {
+    [self performLowPowerOperationForSource:source setting:@(enabled) completion:completion];
+}
+
+- (void)performLowPowerOperationForSource:(NSInteger)source setting:(NSNumber *)setting
+    completion:(void (^)(BOOL, BOOL, NSString *))completion {
+    if (source != 0 && source != 1) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, NO, @"电源目标无效。"); });
+        return;
+    }
+    dispatch_async(_workerQueue, ^{
+        NSError *error = nil;
+        NSString *requirement = [self exactRequirementForBundledHelper:&error];
+        if (requirement == nil || ![self codeAtURL:[NSURL fileURLWithPath:MPFInstalledHelperPath]
+            matchesExactRequirement:requirement] || ![self installedConfigurationMatchesCurrentClient]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(NO, NO, @"此操作需要更新增强服务。请主动选择“启用或更新增强采样…”授权一次，或在系统电池设置中调整。");
+            });
+            return;
+        }
+        __block NSXPCConnection *connection = [[NSXPCConnection alloc]
+            initWithMachServiceName:MPFHelperMachServiceName options:NSXPCConnectionPrivileged];
+        __block BOOL completed = NO;
+        // Called only on the serial worker queue. Terminal paths invalidate the
+        // request so neither late replies nor disconnects can invoke twice.
+        void (^finish)(BOOL, BOOL, NSString *) = ^(BOOL success, BOOL enabled, NSString *message) {
+            if (completed) { return; }
+            completed = YES;
+            connection.interruptionHandler = nil;
+            connection.invalidationHandler = nil;
+            [connection invalidate];
+            connection = nil;
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(success, enabled, message); });
+        };
+        connection.remoteObjectInterface = [NSXPCInterface interfaceWithProtocol:@protocol(MPFPrivilegedMetricsServiceProtocol)];
+        connection.interruptionHandler = ^{ dispatch_async(self->_workerQueue, ^{ finish(NO, NO, @"电源设置服务已中断，请在系统设置中确认。"); }); };
+        connection.invalidationHandler = ^{ dispatch_async(self->_workerQueue, ^{ finish(NO, NO, @"电源设置服务连接已关闭。"); }); };
+        @try { [connection setCodeSigningRequirement:requirement]; }
+        @catch (NSException *exception) { finish(NO, NO, @"无法验证电源设置服务签名。"); return; }
+        [connection activate];
+        id<MPFPrivilegedMetricsServiceProtocol> proxy = [connection remoteObjectProxyWithErrorHandler:^(NSError *proxyError) {
+            dispatch_async(self->_workerQueue, ^{ finish(NO, NO, @"电源设置服务不可用，请在系统设置中确认。"); });
+        }];
+        [proxy protocolVersionWithReply:^(NSInteger version) {
+            dispatch_async(self->_workerQueue, ^{
+                if (completed) { return; }
+                if (version != MPFProtocolVersion) { finish(NO, NO, @"增强服务版本需要更新，此次未修改电源设置。"); return; }
+                void (^reply)(BOOL, BOOL, NSString *) = ^(BOOL success, BOOL actual, NSString *message) {
+                    dispatch_async(self->_workerQueue, ^{ finish(success, actual, message); });
+                };
+                if (setting != nil) {
+                    [proxy setLowPowerModeForSource:source enabled:setting.boolValue ? 1 : 0 reply:reply];
+                } else { [proxy queryLowPowerModeForSource:source reply:reply]; }
+            });
+        }];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)), self->_workerQueue, ^{
+            finish(NO, NO, @"电源设置请求超时，请在系统电池设置中确认实际值。");
+        });
     });
 }
 
@@ -176,7 +264,7 @@ static NSString * const MPFRetryableSessionBusyMarker =
                         options:NSXPCConnectionPrivileged];
     connection.exportedInterface = [NSXPCInterface
         interfaceWithProtocol:@protocol(MPFPrivilegedMetricsClientProtocol)];
-    connection.exportedObject = self;
+    connection.exportedObject = [self receiverForGeneration:generation];
     connection.remoteObjectInterface = [NSXPCInterface
         interfaceWithProtocol:@protocol(MPFPrivilegedMetricsServiceProtocol)];
 
@@ -261,8 +349,7 @@ static NSString * const MPFRetryableSessionBusyMarker =
         return;
     }
     if (version != MPFProtocolVersion) {
-        [self connectionFailedForGeneration:generation
-            message:@"已安装的增强服务版本需要更新。"];
+        [self finishFailed:@"已安装的增强服务版本需要更新，当前使用标准采样。请主动选择“启用或更新增强采样…”授权一次。"];
         return;
     }
 
@@ -280,7 +367,9 @@ static NSString * const MPFRetryableSessionBusyMarker =
     }
 
     __weak typeof(self) weakSelf = self;
-    [_serviceProxy startSamplingWithReply:^(
+    NSInteger interval;
+    @synchronized (self) { interval = _samplingIntervalSeconds; }
+    [_serviceProxy startSamplingWithInterval:interval reply:^(
         BOOL started,
         NSString *errorMessage
     ) {
@@ -1202,6 +1291,31 @@ static NSString * const MPFRetryableSessionBusyMarker =
 
 #pragma mark - Helper callbacks
 
+- (id<MPFPrivilegedMetricsClientProtocol>)receiverForGeneration:(NSUInteger)generation {
+    MPFMetricsConnectionReceiver *receiver = [MPFMetricsConnectionReceiver new];
+    __weak typeof(self) weakSelf = self;
+    receiver.dataReceived = ^(NSData *data) {
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf == nil) { return; }
+        dispatch_async(strongSelf->_workerQueue, ^{
+            if (generation != strongSelf->_connectionGeneration) { return; }
+            [strongSelf receiveData:data];
+        });
+    };
+    receiver.failureReceived = ^(NSString *message) {
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf == nil) { return; }
+        dispatch_async(strongSelf->_workerQueue, ^{
+            if (generation != strongSelf->_connectionGeneration
+                    || [strongSelf isStopRequested]) { return; }
+            [strongSelf finishFailed:message ?: @"增强服务中的 powermetrics 意外停止。"];
+        });
+    };
+    return receiver;
+}
+
+// Called only after the connection receiver validates its generation on the
+// worker queue. Capturing this session's handler also protects main-queue lag.
 - (void)receiveData:(NSData *)data {
     MPFPrivilegedMetricsDataHandler handler = nil;
     @synchronized (self) {
@@ -1218,15 +1332,6 @@ static NSString * const MPFRetryableSessionBusyMarker =
     });
 }
 
-- (void)serviceDidFail:(nullable NSString *)message {
-    dispatch_async(_workerQueue, ^{
-        if (![self isStopRequested]) {
-            [self finishFailed:
-                message ?: @"增强服务中的 powermetrics 意外停止。"];
-        }
-    });
-}
-
 #pragma mark - Completion
 
 - (void)finishFailed:(NSString *)message {
@@ -1239,10 +1344,9 @@ static NSString * const MPFRetryableSessionBusyMarker =
         _workerActive = NO;
         _stopRequested = NO;
         _dataHandler = nil;
-    }
-    [self publishState:MPFPrivilegedMetricsRunnerStateFailed
-                message:message];
-    @synchronized (self) {
+        // Keep terminal publication and handler cleanup atomic with start.
+        // The main queue can immediately start another stream from this event.
+        [self publishState:MPFPrivilegedMetricsRunnerStateFailed message:message];
         _stateHandler = nil;
     }
 }
@@ -1257,9 +1361,7 @@ static NSString * const MPFRetryableSessionBusyMarker =
         _workerActive = NO;
         _stopRequested = NO;
         _dataHandler = nil;
-    }
-    [self publishState:MPFPrivilegedMetricsRunnerStateIdle message:nil];
-    @synchronized (self) {
+        [self publishState:MPFPrivilegedMetricsRunnerStateIdle message:nil];
         _stateHandler = nil;
     }
 }

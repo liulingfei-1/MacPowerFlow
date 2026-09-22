@@ -46,6 +46,11 @@ nonisolated struct BatterySnapshot: Sendable {
     var temperatureC = 0.0
     var cycleCount = 0
     var currentCapacityMAh = 0
+    /// Direct gauge readings only; nil means absent/invalid, while zero is valid.
+    var reportedCurrentCapacityMAh: Int?
+    var reportedCycleCount: Int?
+    /// Registry percentage only, without a capacity-ratio or missing-zero fallback.
+    var reportedLevel: Int?
     var fullCapacityMAh = 0
     var designCapacityMAh = 0
     var healthPercent = 0
@@ -155,8 +160,10 @@ enum BatteryReader {
 
         var result = BatterySnapshot()
         result.isPresent = true
-        let registryLevel = int(property("CurrentCapacity"))
-            ?? int(batteryData["CurrentCapacity"])
+        let rawRegistryLevel = property("CurrentCapacity")
+        let nestedRegistryLevel = batteryData["CurrentCapacity"]
+        let registryLevel = int(rawRegistryLevel) ?? int(nestedRegistryLevel)
+        result.reportedLevel = reportedBatteryLevel(rawRegistryLevel, nestedRegistryLevel)
         result.level = normalizedLevel(
             registryLevel: registryLevel,
             powerSourceCurrent: powerSource.currentCapacity,
@@ -178,6 +185,11 @@ enum BatteryReader {
             // tenths of Kelvin.
             result.temperatureC = Double(smartBatteryTemperature) / 10.0 - 273.15
         }
+        result.reportedCycleCount = reportedNonnegativeInteger(
+            property("CycleCount"), batteryData["CycleCount"])
+        result.reportedCurrentCapacityMAh = reportedNonnegativeInteger(
+            property("AppleRawCurrentCapacity"), batteryData["AppleRawCurrentCapacity"],
+            batteryData["RemainingCapacity"])
         result.cycleCount = firstInt("CycleCount")
         let rawCurrent = firstInt("AppleRawCurrentCapacity")
         result.currentCapacityMAh = rawCurrent > 0
@@ -404,6 +416,24 @@ enum BatteryReader {
             let raw = number(item["Watts"] ?? item["PDPowermW"])
             return partial + (raw.isFinite && raw >= 0 && raw < 1_000_000 ? raw / 1000.0 : 0)
         }
+    }
+
+    nonisolated static func reportedBatteryLevel(_ values: Any?...) -> Int? {
+        values.lazy.compactMap { reportedNonnegativeInteger($0) }
+            .first { (0...100).contains($0) }
+    }
+
+    /// Preserve source presence, reject malformed/fractional/boolean values,
+    /// and never substitute a percentage-derived UI capacity estimate.
+    nonisolated static func reportedNonnegativeInteger(_ values: Any?...) -> Int? {
+        for value in values {
+            guard let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID() else { continue }
+            let raw = number.doubleValue
+            guard raw.isFinite, (0...100_000).contains(raw), raw.rounded(.towardZero) == raw else { continue }
+            return Int(raw)
+        }
+        return nil
     }
 
     nonisolated private static func int(_ value: Any?) -> Int? {

@@ -2,31 +2,76 @@ import Foundation
 import Combine
 import UserNotifications
 
+@MainActor
+protocol PowerNotificationClient {
+    func setDelegate(_ delegate: UNUserNotificationCenterDelegate)
+    func authorizationStatus() async -> UNAuthorizationStatus
+    func requestAuthorization() async throws -> Bool
+    func deliver(_ request: UNNotificationRequest) async throws
+}
+
+@MainActor
+private final class SystemPowerNotificationClient: PowerNotificationClient {
+    private let center = UNUserNotificationCenter.current()
+    func setDelegate(_ delegate: UNUserNotificationCenterDelegate) { center.delegate = delegate }
+    func authorizationStatus() async -> UNAuthorizationStatus { await center.notificationSettings().authorizationStatus }
+    func requestAuthorization() async throws -> Bool { try await center.requestAuthorization(options: [.alert, .sound]) }
+    func deliver(_ request: UNNotificationRequest) async throws { try await center.add(request) }
+}
+
 /// Optional, local-only notifications. Constructing or observing this object
 /// never asks for permission. The user must explicitly call setEnabled(true).
 @MainActor
 final class PowerAlerts: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     @Published private(set) var enabled = false
+    @Published private(set) var requestedEnabled = false
     @Published private(set) var status = "通知已关闭"
     @Published var highPowerThreshold: Double = 50 {
         didSet {
             let normalized = PowerAlertRules.normalizedThreshold(highPowerThreshold)
             if highPowerThreshold != normalized { highPowerThreshold = normalized }
             rules.setHighPowerThreshold(normalized)
+            preferences.set(normalized, forKey: "alerts.highPowerThreshold")
         }
     }
 
-    private let center = UNUserNotificationCenter.current()
+    private let notificationClient: any PowerNotificationClient
+    private let preferences: UserDefaults
     private var rules = PowerAlertRules()
     private var authorizationTask: Task<Void, Never>?
     private var authorizationGeneration = 0
 
-    override init() {
+    init(preferences: UserDefaults = .standard, notificationClient: (any PowerNotificationClient)? = nil) {
+        self.preferences = preferences
+        self.notificationClient = notificationClient ?? SystemPowerNotificationClient()
         super.init()
-        center.delegate = self
+        self.notificationClient.setDelegate(self)
+        let stored = preferences.object(forKey: "alerts.highPowerThreshold") as? Double
+        highPowerThreshold = PowerAlertRules.normalizedThreshold(stored ?? 50)
+        rules.setHighPowerThreshold(highPowerThreshold)
+        requestedEnabled = preferences.bool(forKey: "alerts.enabled")
+    }
+
+    /// Restore only an explicit saved choice. Reading permission never opens a prompt.
+    func restorePreferences() {
+        guard authorizationTask == nil else { return }
+        authorizationGeneration &+= 1
+        let generation = authorizationGeneration
+        guard requestedEnabled else { return }
+        authorizationTask = Task { [weak self] in
+            guard let self else { return }
+            let authorization = await notificationClient.authorizationStatus()
+            guard !Task.isCancelled, generation == authorizationGeneration else { return }
+            authorizationTask = nil
+            enabled = authorization == .authorized || authorization == .provisional
+            rules.resetPending()
+            status = enabled ? "已恢复提醒设置" : "提醒偏好已保存，请在系统设置中允许通知"
+        }
     }
 
     func setEnabled(_ value: Bool) {
+        requestedEnabled = value
+        preferences.set(value, forKey: "alerts.enabled")
         if !value {
             authorizationGeneration &+= 1
             authorizationTask?.cancel()
@@ -43,7 +88,7 @@ final class PowerAlerts: NSObject, ObservableObject, UNUserNotificationCenterDel
         authorizationTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let granted = try await center.requestAuthorization(options: [.alert, .sound])
+                let granted = try await notificationClient.requestAuthorization()
                 guard !Task.isCancelled, generation == authorizationGeneration else { return }
                 authorizationTask = nil
                 rules.resetPending()
@@ -114,7 +159,7 @@ final class PowerAlerts: NSObject, ObservableObject, UNUserNotificationCenterDel
         Task { [weak self] in
             guard let self, enabled, generation == authorizationGeneration else { return }
             do {
-                try await center.add(request)
+                try await notificationClient.deliver(request)
             } catch {
                 guard enabled, generation == authorizationGeneration else { return }
                 status = "提醒未能发送，请检查系统通知设置"

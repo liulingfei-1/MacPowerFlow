@@ -1,20 +1,33 @@
 import AppKit
 import SwiftUI
 
+nonisolated enum EnergyViewContent { case overview, components, hardware }
+
 struct EnergyFlowView: View {
     @ObservedObject var model: PowerMonitor
     @State private var detailExpanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var openDetails: (DetailSection) -> Void = { _ in }
+    var content: EnergyViewContent = .overview
 
     private let accent = Color(red: 0.10, green: 0.78, blue: 0.38)
-    private let background = Color(red: 0.075, green: 0.082, blue: 0.092)
-    private let panel = Color(red: 0.17, green: 0.18, blue: 0.20)
-    private let secondary = Color.white.opacity(0.64)
+    private let background = Color(nsColor: .windowBackgroundColor)
+    private let panel = Color(nsColor: .controlBackgroundColor)
+    private let secondary = Color.primary.opacity(0.64)
 
     var body: some View {
+        switch content {
+        case .overview: overview
+        case .components: componentDetailCard
+        case .hardware: hardwareCard
+        }
+    }
+
+    private var overview: some View {
         ZStack {
             background.ignoresSafeArea()
 
-            ScrollView(showsIndicators: false) {
+            ScrollView {
                 VStack(spacing: 12) {
                     statusStrip
                     batteryRail
@@ -23,10 +36,10 @@ struct EnergyFlowView: View {
                     } else {
                         Text("等待可靠的整机功耗数据").foregroundStyle(.secondary).frame(height: 100)
                     }
-                    componentDetailCard
-                    hardwareCard
-                    processCard
-                    InsightsView(model: model)
+                    readingNotice
+                    compactVitals
+                    MiniHistoryPanel(history: model.history)
+                    quickActions
                     footer
                 }
                 .padding(.horizontal, 14)
@@ -45,7 +58,6 @@ struct EnergyFlowView: View {
             }
         }
         .frame(width: 420)
-        .environment(\.colorScheme, .dark)
     }
 
     private var statusStrip: some View {
@@ -65,6 +77,13 @@ struct EnergyFlowView: View {
 
             Spacer(minLength: 0)
 
+            Button { openDetails(.settings) } label: {
+                Image(systemName: "gearshape").frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .help("设置")
+            .accessibilityLabel("打开 MacPowerFlow 设置")
+
             Button {
                 model.refreshNow()
             } label: {
@@ -76,15 +95,59 @@ struct EnergyFlowView: View {
                             .fill(panel)
                             .overlay {
                                 Circle()
-                                    .stroke(Color.white.opacity(0.11), lineWidth: 1)
+                                    .stroke(Color.primary.opacity(0.11), lineWidth: 1)
                             }
                     )
             }
             .buttonStyle(.plain)
-            .foregroundStyle(Color.white.opacity(0.72))
+            .foregroundStyle(Color.primary.opacity(0.72))
             .help("立即刷新")
             .accessibilityLabel("立即刷新功耗数据")
         }
+    }
+
+    private var readingNotice: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if model.isSupplementingAdapter {
+                Label("已接电源，电池也在给电脑供电", systemImage: "battery.25")
+                    .foregroundStyle(.orange)
+            }
+            if let residual = model.powerBalanceResidual, abs(residual) > 0.5 {
+                Label(String(format: "多源读数差额 %+.1f W", residual), systemImage: "info.circle")
+                Text("采样时刻和测量范围可能不同，原始读数均保留。")
+                    .foregroundStyle(.secondary)
+            } else if model.flowWasAdjusted {
+                Label("流图按整机预算显示，详情保留原始读数", systemImage: "info.circle")
+            }
+        }
+        .font(.system(size: 11))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var compactVitals: some View {
+        HStack(spacing: 12) {
+            Label(model.cpuTempC > 0 ? String(format: "CPU %.0f°", model.cpuTempC) : "CPU —", systemImage: "thermometer.medium")
+            Spacer(minLength: 0)
+            Text(model.gpuTempC > 0 ? String(format: "GPU %.0f°", model.gpuTempC) : "GPU —")
+            Spacer(minLength: 0)
+            Label(model.lowPowerModeEnabled ? "低功耗" : model.thermalStateText, systemImage: model.lowPowerModeEnabled ? "leaf" : "fan")
+        }
+        .font(.system(size: 12)).foregroundStyle(.secondary)
+        .padding(.horizontal, 4)
+    }
+
+    private var quickActions: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+            ForEach([DetailSection.history, .battery, .activity, .settings]) { section in
+                Button { openDetails(section) } label: {
+                    Label(section.title, systemImage: section.symbol)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 5)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .font(.system(size: 12))
     }
 
     private var batteryRail: some View {
@@ -94,17 +157,17 @@ struct EnergyFlowView: View {
                 : 1
             let railStart = model.isCharging
                 ? accent.opacity(0.74)
-                : Color.white.opacity(0.24)
+                : Color.primary.opacity(0.24)
             let railEnd = model.isCharging
                 ? accent.opacity(0.96)
-                : Color.white.opacity(0.42)
+                : Color.primary.opacity(0.42)
 
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(panel)
                     .overlay {
                         Capsule()
-                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
                     }
 
                 Capsule()
@@ -128,8 +191,8 @@ struct EnergyFlowView: View {
                     Spacer()
 
                     Text(batteryRailDetail)
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(Color.white.opacity(0.76))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.primary.opacity(0.76))
                         .lineLimit(1)
                         .minimumScaleFactor(0.72)
                         .allowsTightening(true)
@@ -169,28 +232,28 @@ struct EnergyFlowView: View {
         .frame(height: 228)
     }
 
-    private var componentDetailCard: some View {
+    var componentDetailCard: some View {
         VStack(spacing: 0) {
             Button {
-                withAnimation(.easeInOut(duration: 0.18)) {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
                     detailExpanded.toggle()
                 }
             } label: {
                 HStack(spacing: 9) {
                     ZStack {
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(Color.white.opacity(0.07))
+                            .fill(Color.primary.opacity(0.07))
                             .frame(width: 30, height: 30)
                         Image(systemName: "point.3.connected.trianglepath.dotted")
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(Color.white.opacity(0.66))
+                            .foregroundStyle(Color.primary.opacity(0.66))
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text("其他功耗分项")
                             .font(.system(size: 12, weight: .semibold))
                         Text("当前功耗分配")
-                            .font(.system(size: 9.5))
+                            .font(.system(size: 11))
                             .foregroundStyle(secondary)
                     }
 
@@ -201,7 +264,7 @@ struct EnergyFlowView: View {
                         .monospacedDigit()
 
                     Image(systemName: detailExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(secondary)
                 }
                 .contentShape(Rectangle())
@@ -217,13 +280,13 @@ struct EnergyFlowView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text("当前分配")
-                            .font(.system(size: 9.5, weight: .semibold))
+                            .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(secondary)
                         Spacer()
                         Text(watts(model.effectiveOtherPowerWatts, allowZero: true))
-                            .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
                             .monospacedDigit()
-                            .foregroundStyle(Color.white.opacity(0.62))
+                            .foregroundStyle(Color.primary.opacity(0.62))
                     }
 
                     LazyVGrid(
@@ -251,16 +314,16 @@ struct EnergyFlowView: View {
                     }
 
                     Text(otherModelNote)
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(Color.white.opacity(0.52))
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.primary.opacity(0.52))
                         .fixedSize(horizontal: false, vertical: true)
 
                     Text(
                         "“其他”是整机负载扣除 CPU、GPU 与显示后的剩余功耗；"
                             + "分项会随系统活动及可用传感器同步变化。"
                     )
-                        .font(.system(size: 10))
-                        .foregroundStyle(Color.white.opacity(0.56))
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.primary.opacity(0.56))
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.horizontal, 12)
@@ -272,7 +335,7 @@ struct EnergyFlowView: View {
         .graphiteCard()
     }
 
-    private var hardwareCard: some View {
+    var hardwareCard: some View {
         VStack(spacing: 0) {
             cardHeader("电源与电池", symbol: "battery.100")
 
@@ -418,17 +481,17 @@ struct EnergyFlowView: View {
         .graphiteCard()
     }
 
-    private var processCard: some View {
+    var processCard: some View {
         VStack(spacing: 0) {
             if model.topProcesses.isEmpty {
                 HStack(spacing: 10) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(accent)
-                    Text("没有明显的高 CPU 进程")
+                    Image(systemName: model.processStatusSymbol)
+                        .foregroundStyle(.secondary)
+                    Text(model.processStatusText)
                         .font(.system(size: 12, weight: .semibold))
                     Spacer()
-                    Text("当前稳定")
-                        .font(.system(size: 10, weight: .medium))
+                    Text(model.processDataReady ? "已采集" : "等待更新")
+                        .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(secondary)
                 }
                 .padding(.horizontal, 13)
@@ -438,26 +501,26 @@ struct EnergyFlowView: View {
                 ForEach(model.topProcesses) { process in
                     HStack(spacing: 9) {
                         Text(process.name.prefix(1).uppercased())
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
                             .frame(width: 24, height: 24)
                             .background(
                                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                    .fill(Color.white.opacity(0.07))
+                                    .fill(Color.primary.opacity(0.07))
                             )
                         Text(process.name)
                             .font(.system(size: 11.5, weight: .medium))
                             .lineLimit(1)
                         Spacer()
                         Text(String(format: "%.1f%% CPU", process.cpuPercent))
-                            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(Color.white.opacity(0.63))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(Color.primary.opacity(0.63))
                     }
                     .padding(.horizontal, 12)
                     .frame(minHeight: 34)
                 }
                 Text("进程显示的是 CPU 占用，不是逐应用瓦数。")
-                    .font(.system(size: 9))
-                    .foregroundStyle(Color.white.opacity(0.44))
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.primary.opacity(0.44))
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -486,8 +549,8 @@ struct EnergyFlowView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
         }
-        .font(.system(size: 9.5, weight: .medium))
-        .foregroundStyle(Color.white.opacity(0.44))
+        .font(.system(size: 11, weight: .medium))
+        .foregroundStyle(Color.primary.opacity(0.44))
         .padding(.horizontal, 2)
     }
 
@@ -500,7 +563,7 @@ struct EnergyFlowView: View {
                     .frame(width: 10, height: 10)
             } else {
                 Image(systemName: administratorStatusSymbol)
-                    .font(.system(size: 8.5, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
             }
 
             Text(administratorStatusText)
@@ -515,13 +578,13 @@ struct EnergyFlowView: View {
     private func statusPill(_ title: String, symbol: String) -> some View {
         HStack(spacing: 5) {
             Image(systemName: symbol)
-                .font(.system(size: 8.5, weight: .bold))
+                .font(.system(size: 11, weight: .bold))
             Text(title)
-                .font(.system(size: 10.5, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .lineLimit(1)
                 .minimumScaleFactor(0.82)
         }
-        .foregroundStyle(Color.white.opacity(0.74))
+        .foregroundStyle(Color.primary.opacity(0.74))
         .padding(.horizontal, 9)
         .frame(height: 28)
         .background(
@@ -529,7 +592,7 @@ struct EnergyFlowView: View {
                 .fill(panel)
                 .overlay {
                     Capsule()
-                        .stroke(Color.white.opacity(0.11), lineWidth: 1)
+                        .stroke(Color.primary.opacity(0.11), lineWidth: 1)
                 }
         )
         .accessibilityElement(children: .combine)
@@ -542,20 +605,20 @@ struct EnergyFlowView: View {
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
-                .font(.system(size: 8.5, weight: .medium))
-                .foregroundStyle(Color.white.opacity(0.45))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.primary.opacity(0.45))
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
             Text(value)
-                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
 
             if let detail {
                 Text(detail)
-                    .font(.system(size: 7.5, weight: .medium))
-                    .foregroundStyle(Color.white.opacity(0.35))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.primary.opacity(0.35))
                     .lineLimit(1)
                     .minimumScaleFactor(0.68)
             }
@@ -568,7 +631,7 @@ struct EnergyFlowView: View {
         )
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.045))
+                .fill(Color.primary.opacity(0.045))
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
@@ -578,12 +641,12 @@ struct EnergyFlowView: View {
     private func cardHeader(_ title: String, symbol: String) -> some View {
         HStack(spacing: 7) {
             Image(systemName: symbol)
-                .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(0.58))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.primary.opacity(0.58))
                 .frame(width: 15)
             Text(title)
                 .font(.system(size: 11.5, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(0.76))
+                .foregroundStyle(Color.primary.opacity(0.76))
             Spacer()
         }
         .padding(.horizontal, 12)
@@ -598,27 +661,27 @@ struct EnergyFlowView: View {
     ) -> some View {
         HStack(spacing: 8) {
             Image(systemName: symbol)
-                .font(.system(size: 10))
-                .foregroundStyle(Color.white.opacity(0.48))
+                .font(.system(size: 11))
+                .foregroundStyle(Color.primary.opacity(0.48))
                 .frame(width: 15)
 
             Text(label)
                 .font(.system(size: 10.8))
-                .foregroundStyle(Color.white.opacity(0.56))
+                .foregroundStyle(Color.primary.opacity(0.56))
 
             Spacer(minLength: 8)
 
             if let detail {
                 Text(detail)
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(Color.white.opacity(0.42))
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.primary.opacity(0.42))
                     .lineLimit(1)
             }
 
             Text(value)
                 .font(.system(size: 10.8, weight: .semibold, design: .rounded))
                 .monospacedDigit()
-                .foregroundStyle(Color.white.opacity(0.84))
+                .foregroundStyle(Color.primary.opacity(0.84))
                 .lineLimit(1)
                 .minimumScaleFactor(0.74)
         }
@@ -631,7 +694,7 @@ struct EnergyFlowView: View {
 
     private var hairline: some View {
         Rectangle()
-            .fill(Color.white.opacity(0.09))
+            .fill(Color.primary.opacity(0.09))
             .frame(height: 1)
     }
 
@@ -691,7 +754,7 @@ struct EnergyFlowView: View {
         case .failed:
             return .orange
         case .inactive, .authorizing, .starting, .stopping:
-            return Color.white.opacity(0.48)
+            return Color.primary.opacity(0.48)
         }
     }
 
@@ -779,6 +842,10 @@ struct EnergyFlowView: View {
     }
 
     private var fanSummary: String {
+        if let fans = model.fans {
+            if fans.isEmpty { return "无风扇" }
+            return fans.map { $0.currentRPM.map { String(format: "%.0f", $0) } ?? "—" }.joined(separator: " / ") + " RPM"
+        }
         if model.fanRPM > 0, model.fan2RPM > 0 {
             return "\(model.fanRPM) / \(model.fan2RPM) RPM"
         }
@@ -810,9 +877,7 @@ struct EnergyFlowView: View {
 
     private var lastUpdatedText: String {
         guard hasSample else { return "等待首次采样" }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter.string(from: model.lastUpdated)
+        return model.lastUpdated.formatted(date: .omitted, time: .standard)
     }
 
     private func watts(
@@ -964,6 +1029,7 @@ private struct FlowRibbonShape: Shape {
 }
 
 private struct SculptedPowerFlow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let isOnAC: Bool
     let batteryPresent: Bool
     let isFullyCharged: Bool
@@ -979,11 +1045,11 @@ private struct SculptedPowerFlow: View {
     let gpuAvailable: Bool
     let displayAvailable: Bool
 
-    private let fill = Color(red: 0.19, green: 0.20, blue: 0.22)
-    private let strongFill = Color(red: 0.22, green: 0.23, blue: 0.25)
-    private let stroke = Color.white.opacity(0.13)
-    private let text = Color.white.opacity(0.88)
-    private let quiet = Color.white.opacity(0.60)
+    private let fill = Color.primary.opacity(0.08)
+    private let strongFill = Color.primary.opacity(0.12)
+    private let stroke = Color.primary.opacity(0.13)
+    private let text = Color.primary.opacity(0.88)
+    private let quiet = Color.primary.opacity(0.60)
     private let chargingAccent = Color(red: 0.10, green: 0.78, blue: 0.38)
 
     var body: some View {
@@ -1026,7 +1092,7 @@ private struct SculptedPowerFlow: View {
                     }
                     .opacity(isOnAC && batteryPresent ? 1 : 0)
                     .animation(
-                        .easeInOut(duration: 0.35),
+                        reduceMotion ? nil : .easeInOut(duration: 0.35),
                         value: safePower(batteryPower)
                     )
 
@@ -1036,7 +1102,7 @@ private struct SculptedPowerFlow: View {
                             ? "arrow.left"
                             : "arrow.right"
                     )
-                    .font(.system(size: 7.5, weight: .black))
+                    .font(.system(size: 11, weight: .black))
                     .foregroundStyle(
                         batteryDirection == .charging
                             ? chargingAccent
@@ -1045,7 +1111,7 @@ private struct SculptedPowerFlow: View {
                     .frame(width: 15, height: 15)
                     .background(
                         Circle()
-                            .fill(Color(red: 0.11, green: 0.12, blue: 0.13))
+                            .fill(Color(nsColor: .windowBackgroundColor))
                             .overlay {
                                 Circle().stroke(secondaryLinkStroke, lineWidth: 1)
                             }
@@ -1077,7 +1143,7 @@ private struct SculptedPowerFlow: View {
                             ribbon.stroke(stroke, lineWidth: 1)
                         }
                         .animation(
-                            .easeInOut(duration: 0.35),
+                            reduceMotion ? nil : .easeInOut(duration: 0.35),
                             value: branch.definition.power
                         )
                 }
@@ -1233,7 +1299,7 @@ private struct SculptedPowerFlow: View {
 
             VStack(spacing: 4) {
                 Text(isOnAC ? "适配器" : "电池")
-                    .font(.system(size: 9.5, weight: .medium))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(quiet)
                 Text(watt(sourcePower))
                     .font(.system(size: 16, weight: .bold, design: .rounded))
@@ -1260,15 +1326,15 @@ private struct SculptedPowerFlow: View {
             && batteryDirection == .supplying
         let stateColor = charging
             ? chargingAccent
-            : (supplying ? Color.white.opacity(0.86) : quiet)
+            : (supplying ? Color.primary.opacity(0.86) : quiet)
 
         return HStack(spacing: 6) {
             Image(systemName: secondarySourceSymbol)
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(stateColor)
 
             Text(secondarySourceText)
-                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(text)
                 .lineLimit(1)
@@ -1282,14 +1348,14 @@ private struct SculptedPowerFlow: View {
                 .fill(
                     charging
                         ? chargingAccent.opacity(0.13)
-                        : (supplying ? Color.white.opacity(0.08) : fill)
+                        : (supplying ? Color.primary.opacity(0.08) : fill)
                 )
                 .overlay {
                     RoundedRectangle(cornerRadius: height / 2, style: .continuous)
                         .stroke(
                             charging
                                 ? chargingAccent.opacity(0.52)
-                                : (supplying ? Color.white.opacity(0.25) : stroke),
+                                : (supplying ? Color.primary.opacity(0.25) : stroke),
                             lineWidth: 1
                         )
                 }
@@ -1358,7 +1424,7 @@ private struct SculptedPowerFlow: View {
                 .minimumScaleFactor(0.56)
                 .allowsTightening(true)
             Text("系统")
-                .font(.system(size: 8.5, weight: .medium))
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(quiet)
         }
         .frame(width: width)
@@ -1474,7 +1540,7 @@ private struct SculptedPowerFlow: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(branch.label)
-                    .font(.system(size: 8.5, weight: .medium))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(quiet)
                     .lineLimit(1)
 
@@ -1506,9 +1572,9 @@ private struct SculptedPowerFlow: View {
         case .charging:
             return chargingAccent.opacity(0.42)
         case .supplying:
-            return Color.white.opacity(0.20)
+            return Color.primary.opacity(0.20)
         case .idle, .unknown, .unavailable:
-            return Color.white.opacity(0.055)
+            return Color.primary.opacity(0.055)
         }
     }
 
@@ -1517,9 +1583,9 @@ private struct SculptedPowerFlow: View {
         case .charging:
             return chargingAccent.opacity(0.68)
         case .supplying:
-            return Color.white.opacity(0.30)
+            return Color.primary.opacity(0.30)
         case .idle, .unknown, .unavailable:
-            return Color.white.opacity(0.10)
+            return Color.primary.opacity(0.10)
         }
     }
 
@@ -1574,10 +1640,10 @@ private extension View {
     func graphiteCard() -> some View {
         background(
             RoundedRectangle(cornerRadius: 19, style: .continuous)
-                .fill(Color(red: 0.17, green: 0.18, blue: 0.20))
+                .fill(Color(nsColor: .controlBackgroundColor))
                 .overlay {
                     RoundedRectangle(cornerRadius: 19, style: .continuous)
-                        .stroke(Color.white.opacity(0.11), lineWidth: 1)
+                        .stroke(Color.primary.opacity(0.11), lineWidth: 1)
                 }
         )
     }

@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import "../../PowerFlow/PrivilegedMetricsRunner.h"
+#import "../../Shared/PrivilegedMetricsXPCProtocol.h"
 
 // Exercise the production state machine without touching launchd or authd.
 @interface MPFPrivilegedMetricsRunner (Testing)
@@ -11,6 +12,9 @@
 - (BOOL)runAuthorizedInstaller:(NSError **)error;
 - (void)connectionFailedForGeneration:(NSUInteger)generation message:(NSString *)message;
 - (void)scheduleConnectionRetryAfter:(NSTimeInterval)delay;
+- (void)receivedProtocolVersion:(NSInteger)version generation:(NSUInteger)generation;
+- (void)requestSamplingForGeneration:(NSUInteger)generation;
+- (id<MPFPrivilegedMetricsClientProtocol>)receiverForGeneration:(NSUInteger)generation;
 @end
 
 @interface TestRunner : MPFPrivilegedMetricsRunner
@@ -37,6 +41,22 @@
 - (void)scheduleConnectionRetryAfter:(NSTimeInterval)delay {
     if (self.scheduleRetries) { [super scheduleConnectionRetryAfter:delay]; }
 }
+@end
+
+@interface SamplingProxy : NSObject <MPFPrivilegedMetricsServiceProtocol>
+@property NSInteger interval;
+@property NSUInteger starts;
+@property BOOL busy;
+@end
+@implementation SamplingProxy
+- (void)protocolVersionWithReply:(void (^)(NSInteger))reply { reply(2); }
+- (void)startSamplingWithReply:(void (^)(BOOL, NSString *))reply { self.starts++; reply(NO, @"Legacy selector must not be used"); }
+- (void)startSamplingWithInterval:(NSInteger)seconds reply:(void (^)(BOOL, NSString *))reply {
+    self.interval = seconds; self.starts++; reply(!self.busy, self.busy ? @"MPF_RETRY_SESSION_BUSY" : nil);
+}
+- (void)stopSamplingWithReply:(void (^)(BOOL, NSString *))reply { reply(YES, nil); }
+- (void)queryLowPowerModeForSource:(NSInteger)source reply:(void (^)(BOOL, BOOL, NSString *))reply { reply(NO, NO, @"Not expected"); }
+- (void)setLowPowerModeForSource:(NSInteger)source enabled:(NSInteger)enabled reply:(void (^)(BOOL, BOOL, NSString *))reply { reply(NO, NO, @"Not expected"); }
 @end
 
 static void require(BOOL condition, NSString *message) {
@@ -95,6 +115,71 @@ int main(void) {
         require(restarted.connections == 2, @"old retry cannot enter the new session");
         [restarted stop]; flush(restarted);
         puts("PASS: stop/start ignores previous session retry");
+        for (NSNumber *interval in @[@2, @5, @10]) {
+            TestRunner *runner = [TestRunner new];
+            require([runner configureSamplingInterval:interval.integerValue], @"allowed cadence accepted");
+            require(![runner configureSamplingInterval:3], @"arbitrary cadence rejected");
+            start(runner, NO);
+            require(![runner configureSamplingInterval:2], @"active runner cannot mutate cadence in place");
+            SamplingProxy *proxy = [SamplingProxy new];
+            [runner setValue:proxy forKey:@"serviceProxy"];
+            dispatch_sync(worker(runner), ^{ [runner receivedProtocolVersion:2 generation:0]; });
+            flush(runner);
+            require(proxy.starts == 1 && proxy.interval == interval.integerValue, @"selected cadence actually crosses v2 XPC");
+            [runner stop]; flush(runner);
+        }
+        puts("PASS: fixed 2/5/10 second intervals cross XPC; invalid and in-place interval changes rejected");
+        TestRunner *oldProtocol = [TestRunner new];
+        start(oldProtocol, NO);
+        SamplingProxy *oldProxy = [SamplingProxy new];
+        [oldProtocol setValue:oldProxy forKey:@"serviceProxy"];
+        dispatch_sync(worker(oldProtocol), ^{ [oldProtocol receivedProtocolVersion:1 generation:0]; });
+        require(oldProtocol.state == MPFPrivilegedMetricsRunnerStateFailed && oldProxy.starts == 0,
+                @"v1 helper rejected before sending unknown v2 selector");
+        require(oldProtocol.installations == 0, @"protocol mismatch never authorizes implicitly");
+        puts("PASS: v1 helper fails safely before new selector and never auto-installs");
+        TestRunner *busy = [TestRunner new];
+        start(busy, NO);
+        SamplingProxy *busyProxy = [SamplingProxy new]; busyProxy.busy = YES;
+        [busy setValue:busyProxy forKey:@"serviceProxy"];
+        dispatch_sync(worker(busy), ^{ [busy receivedProtocolVersion:2 generation:0]; });
+        flush(busy); [busy stop]; flush(busy);
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
+        flush(busy);
+        require(busyProxy.starts == 1 && busy.state == MPFPrivilegedMetricsRunnerStateIdle,
+                @"pending cadence-start handoff retry cannot undo stop");
+        puts("PASS: busy-session start retry stays cancelled after stop");
+        TestRunner *invalidPower = [TestRunner new];
+        __block BOOL rejected = NO;
+        [invalidPower setLowPowerModeForSource:99 enabled:YES completion:^(BOOL success, BOOL actual, NSString *message) {
+            rejected = !success && message.length > 0;
+        }];
+        pauseBriefly();
+        require(rejected && invalidPower.connections == 0 && invalidPower.installations == 0,
+                @"invalid power source rejected before connection/auth");
+        puts("PASS: invalid low-power source never connects or authorizes");
+        TestRunner *callbacks = [TestRunner new];
+        __block NSUInteger received = 0;
+        [callbacks startAllowingInstallation:NO dataHandler:^(NSData *data) { received++; }
+                               stateHandler:^(MPFPrivilegedMetricsRunnerState state, NSString *message) {}];
+        flush(callbacks);
+        id<MPFPrivilegedMetricsClientProtocol> oldReceiver = [callbacks receiverForGeneration:0];
+        [callbacks stop]; flush(callbacks);
+        [callbacks startAllowingInstallation:NO dataHandler:^(NSData *data) { received++; }
+                               stateHandler:^(MPFPrivilegedMetricsRunnerState state, NSString *message) {}];
+        flush(callbacks);
+        [oldReceiver receiveData:[NSData dataWithBytes:"old" length:3]];
+        [oldReceiver serviceDidFail:@"old connection failure"];
+        flush(callbacks); pauseBriefly();
+        require(received == 0 && callbacks.isRunning, @"old connection cannot deliver to or stop new stream");
+        NSUInteger generation = [[callbacks valueForKey:@"connectionGeneration"] unsignedIntegerValue];
+        id<MPFPrivilegedMetricsClientProtocol> receiver = [callbacks receiverForGeneration:generation];
+        [receiver receiveData:[NSData dataWithBytes:"new" length:3]];
+        flush(callbacks); pauseBriefly();
+        require(received == 1, @"current connection continues delivering data");
+        [receiver serviceDidFail:@"current failure"]; flush(callbacks);
+        require(callbacks.state == MPFPrivilegedMetricsRunnerStateFailed, @"current connection failure remains actionable");
+        puts("PASS: connection-bound receiver rejects stale data/failure across cadence restart");
         return 0;
     }
 }

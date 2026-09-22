@@ -19,7 +19,7 @@ typedef void (^MPFPrivilegedMetricsStateHandler)(
     NSString * _Nullable message
 );
 
-/// Connects to MacPowerFlow's launchd-managed, read-only metrics helper.
+/// Connects to MacPowerFlow's launchd-managed metrics and restricted power helper.
 ///
 /// Only an explicit user action may allow installation. Automatic launches
 /// connect silently. When allowed, a new app build requests one
@@ -35,6 +35,17 @@ typedef void (^MPFPrivilegedMetricsStateHandler)(
 - (void)startAllowingInstallation:(BOOL)allowInstallation
                    dataHandler:(MPFPrivilegedMetricsDataHandler)dataHandler
                 stateHandler:(MPFPrivilegedMetricsStateHandler)stateHandler;
+
+/// Applied to the next stream. Invalid intervals are rejected without side effects.
+- (BOOL)configureSamplingInterval:(NSInteger)seconds;
+
+/// Fixed pmset operation via an already installed v2 helper. Never installs/prompts.
+- (void)queryLowPowerModeForSource:(NSInteger)source
+    completion:(void (^)(BOOL success, BOOL enabled, NSString * _Nullable message))completion
+    NS_SWIFT_NAME(queryLowPowerMode(source:completion:));
+- (void)setLowPowerModeForSource:(NSInteger)source enabled:(BOOL)enabled
+    completion:(void (^)(BOOL success, BOOL actualEnabled, NSString * _Nullable message))completion
+    NS_SWIFT_NAME(setLowPowerMode(source:enabled:completion:));
 
 /// Stops only the current powermetrics stream and closes the XPC connection.
 /// The launchd registration remains installed so the next app launch is

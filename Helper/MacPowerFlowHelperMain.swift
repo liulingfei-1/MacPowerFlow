@@ -140,10 +140,15 @@ private final class MetricsCoordinator {
 
     func start(
         owner: UUID,
+        intervalSeconds: Int = 2,
         sendData: @escaping (Data) -> Void,
         sendFailure: @escaping (String) -> Void,
         reply: @escaping (Bool, String?) -> Void
     ) {
+        guard MPFPrivilegedService.allowedSamplingIntervals.contains(intervalSeconds) else {
+            reply(false, "采样间隔只能为2、5或10秒。")
+            return
+        }
         queue.async {
             self.reapFinishedChildIfNeeded()
             guard self.childProcessIdentifier == nil else {
@@ -160,7 +165,7 @@ private final class MetricsCoordinator {
             }
 
             do {
-                let spawnedProcess = try self.spawnPowermetrics()
+                let spawnedProcess = try self.spawnPowermetrics(intervalSeconds: intervalSeconds)
                 self.ownerIdentifier = owner
                 self.childProcessIdentifier =
                     spawnedProcess.processIdentifier
@@ -301,7 +306,10 @@ private final class MetricsCoordinator {
         }
     }
 
-    private func spawnPowermetrics() throws -> SpawnedProcess {
+    private func spawnPowermetrics(intervalSeconds: Int) throws -> SpawnedProcess {
+        guard let samplingArguments = MPFPrivilegedService.samplingArguments(intervalSeconds: intervalSeconds) else {
+            throw HelperFailure.message("采样间隔无效。")
+        }
         var outputPipe = [Int32](repeating: -1, count: 2)
         var errorPipe = [Int32](repeating: -1, count: 2)
         guard outputPipe.withUnsafeMutableBufferPointer({
@@ -392,7 +400,7 @@ private final class MetricsCoordinator {
 
         let arguments =
             [MPFPrivilegedService.powermetricsPath] +
-            MPFPrivilegedService.powermetricsArguments
+            samplingArguments
         let environment = [
             "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
             "LANG=C",
@@ -757,6 +765,94 @@ private final class MetricsCoordinator {
     }
 }
 
+/// Separately serialized, narrow power-mode operation; never shares arbitrary
+/// commands or client-controlled paths with the sampling process launcher.
+private final class LowPowerCoordinator {
+    static let shared = LowPowerCoordinator()
+    private let queue = DispatchQueue(label: "com.llf.MacPowerFlow.Helper.lowpower")
+    private let execute: ([String]) throws -> String
+    init(execute: @escaping ([String]) throws -> String = LowPowerCoordinator.run) {
+        self.execute = execute
+    }
+
+    func perform(source: Int, setting: Int?, isAuthorized: @escaping () -> Bool,
+                 reply: @escaping (Bool, Bool, String?) -> Void) {
+        guard MPFLowPowerPolicy.arguments(source: source, enabled: setting ?? 0) != nil else {
+            reply(false, false, "电源目标或低功耗设置值无效。"); return
+        }
+        queue.async {
+            do {
+                guard isAuthorized() else { throw HelperFailure.message("请求连接已关闭，未修改设置。") }
+                let capabilities = try self.execute(["-g", "cap"])
+                guard MPFLowPowerPolicy.supportsLowPower(capabilities) else {
+                    throw HelperFailure.message("本机不支持低功耗模式。")
+                }
+                let before = try self.execute(["-g", "custom"])
+                guard let previous = MPFLowPowerPolicy.configuredValue(source: source, output: before) else {
+                    throw HelperFailure.message("无法确认此电源类型的低功耗设置，未修改设置。")
+                }
+                if let setting {
+                    guard isAuthorized(), let arguments = MPFLowPowerPolicy.arguments(source: source, enabled: setting) else {
+                        throw HelperFailure.message("请求已取消，未修改设置。")
+                    }
+                    if previous != (setting == 1) { _ = try self.execute(arguments) }
+                }
+                let after = try self.execute(["-g", "custom"])
+                guard let actual = MPFLowPowerPolicy.configuredValue(source: source, output: after) else {
+                    throw HelperFailure.message("无法回读低功耗设置，请在系统电池设置中确认。")
+                }
+                if let setting, actual != (setting == 1) {
+                    reply(false, actual, "系统回读值与请求不一致，请在系统电池设置中确认。")
+                } else { reply(true, actual, nil) }
+            } catch { reply(false, false, error.localizedDescription) }
+        }
+    }
+
+    /// Fixed executable, clean locale, bounded output/time. No shell is used.
+    private static func run(_ arguments: [String]) throws -> String {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: MPFLowPowerPolicy.executable)
+        process.arguments = arguments
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C", "LC_ALL": "C"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = pipe
+        process.standardError = pipe
+        let fd = pipe.fileHandleForReading.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        try process.run()
+        pipe.fileHandleForWriting.closeFile()
+        defer { pipe.fileHandleForReading.closeFile() }
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        var output = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = read(fd, &buffer, buffer.count)
+            if count > 0 {
+                output.append(contentsOf: buffer.prefix(count))
+                if output.count > 65536 {
+                    _ = kill(process.processIdentifier, SIGKILL); process.waitUntilExit()
+                    throw HelperFailure.message("系统电源设置输出超过限制。")
+                }
+                continue
+            }
+            if !process.isRunning {
+                if count <= 0 { break }
+            }
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                _ = kill(process.processIdentifier, SIGKILL); process.waitUntilExit()
+                throw HelperFailure.message("系统电源设置请求超时，请在系统设置中确认。")
+            }
+            usleep(10000)
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw HelperFailure.message("系统电源命令失败（状态\(process.terminationStatus)）。")
+        }
+        return String(decoding: output, as: UTF8.self)
+    }
+}
+
 private final class MetricsConnectionService:
     NSObject,
     MPFPrivilegedMetricsServiceProtocol
@@ -774,9 +870,11 @@ private final class MetricsConnectionService:
         reply(MPFPrivilegedService.protocolVersion)
     }
 
-    func startSampling(
-        withReply reply: @escaping (Bool, String?) -> Void
-    ) {
+    func startSampling(withReply reply: @escaping (Bool, String?) -> Void) {
+        startSampling(intervalSeconds: 2, withReply: reply)
+    }
+
+    func startSampling(intervalSeconds: Int, withReply reply: @escaping (Bool, String?) -> Void) {
         guard currentConnection() != nil else {
             reply(false, "The XPC connection is no longer available.")
             return
@@ -785,6 +883,7 @@ private final class MetricsConnectionService:
         let owner = ownerIdentifier
         MetricsCoordinator.shared.start(
             owner: owner,
+            intervalSeconds: intervalSeconds,
             sendData: { [weak self] data in
                 self?.send(data)
             },
@@ -793,6 +892,20 @@ private final class MetricsConnectionService:
             },
             reply: reply
         )
+    }
+
+    func queryLowPowerMode(source: Int, withReply reply: @escaping (Bool, Bool, String?) -> Void) {
+        guard currentConnection() != nil else { reply(false, false, "连接已关闭。"); return }
+        LowPowerCoordinator.shared.perform(source: source, setting: nil, isAuthorized: { [weak self] in
+            self?.currentConnection() != nil
+        }, reply: reply)
+    }
+
+    func setLowPowerMode(source: Int, enabled: Int, withReply reply: @escaping (Bool, Bool, String?) -> Void) {
+        guard currentConnection() != nil else { reply(false, false, "连接已关闭。"); return }
+        LowPowerCoordinator.shared.perform(source: source, setting: enabled, isAuthorized: { [weak self] in
+            self?.currentConnection() != nil
+        }, reply: reply)
     }
 
     func stopSampling(

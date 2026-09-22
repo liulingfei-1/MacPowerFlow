@@ -189,6 +189,71 @@ final class PowerHistoryTests: XCTestCase {
         XCTAssertNil(core.archive.points[0].gpuWindowEnd)
     }
 
+    func testChartReductionPreservesBriefPeakValleyAndEndpoints() {
+        var samples = (0..<1000).map { point(Double($0), watts: 10) }
+        samples[123].systemWatts = 200
+        samples[456].systemWatts = 0
+        let reduced = PowerHistoryCore.chartPoints(points: samples, targetCount: 40)
+        XCTAssertLessThanOrEqual(reduced.count, 40)
+        XCTAssertEqual(reduced.first?.timestamp, samples.first?.timestamp)
+        XCTAssertTrue(reduced.first?.startsNewSegment == true)
+        XCTAssertEqual(reduced.last, samples.last)
+        XCTAssertTrue(reduced.contains(samples[123]))
+        XCTAssertTrue(reduced.contains(samples[456]))
+    }
+
+    func testChartReductionPreservesMissingAndExplicitSegmentBoundaries() {
+        var samples = (0..<50).map { point(Double($0), watts: Double($0)) }
+        samples[10].systemWatts = nil
+        samples[20].quality = .stale
+        samples[30].startsNewSegment = true
+        let reduced = PowerHistoryCore.chartPoints(points: samples, targetCount: 4)
+        for index in [0, 9, 10, 11, 19, 20, 21, 29, 30, 49] {
+            XCTAssertTrue(reduced.contains { $0.timestamp == samples[index].timestamp }, "Lost boundary \(index)")
+        }
+        XCTAssertGreaterThan(reduced.count, 4, "Boundaries take precedence over point target")
+    }
+
+    func testChartReductionPreservesSourceAndLongTimeGapBoundaries() {
+        let samples = [point(0), point(1), point(2, source: "B"), point(3, source: "B"),
+                       point(100, source: "B"), point(101, source: "B")]
+        let reduced = PowerHistoryCore.chartPoints(points: samples, targetCount: 2)
+        XCTAssertEqual(reduced.map(\.timestamp), samples.map(\.timestamp))
+        XCTAssertEqual(reduced.filter(\.startsNewSegment).map(\.timestamp), [date(0), date(2), date(100)])
+    }
+
+    func testTwoHoursOfContinuousThreeSecondSamplesDoesNotGainFalseGapsAfterReduction() {
+        let samples = stride(from: 0.0, through: 7200, by: 3).map { point($0, watts: 10 + sin($0 / 60)) }
+        let reduced = PowerHistoryCore.chartPoints(points: samples, targetCount: 400)
+        XCTAssertLessThanOrEqual(reduced.count, 400)
+        XCTAssertEqual(reduced.filter(\.startsNewSegment).count, 1)
+        XCTAssertTrue(zip(reduced, reduced.dropFirst()).contains {
+            $1.timestamp.timeIntervalSince($0.timestamp) > 12
+        }, "Fixture must exercise sparse points that must not become gaps")
+        XCTAssertEqual(reduced.first?.timestamp, date(0))
+        XCTAssertEqual(reduced.last?.timestamp, date(7200))
+    }
+
+    func testRealTimeGapIsMarkedEvenWhenNoReductionIsNeeded() {
+        let samples = [point(0), point(3), point(6), point(60), point(63)]
+        let returned = PowerHistoryCore.chartPoints(points: samples, targetCount: 400)
+        XCTAssertEqual(returned.map(\.timestamp), samples.map(\.timestamp))
+        XCTAssertEqual(returned.filter(\.startsNewSegment).map(\.timestamp), [date(0), date(60)])
+        XCTAssertTrue(samples.allSatisfy { !$0.startsNewSegment }, "Input points remain unmodified")
+    }
+
+    func testCompactArchiveRemainsCompatibleAndComparisonCoverageIsExplicit() throws {
+        var core = history()
+        core.startSession(name: "compile", at: date(0))
+        core.append(point(0)); core.append(point(6))
+        let session = try XCTUnwrap(core.endSession(at: date(12)))
+        XCTAssertEqual(session.elapsedSeconds, 12)
+        XCTAssertEqual(session.coverageFraction, 0.5)
+        let bytes = try core.jsonData()
+        XCTAssertFalse(bytes.contains(10))
+        XCTAssertEqual(try PowerHistoryCore.decodeArchive(bytes).sessions.first, session)
+    }
+
     func testCapacityAndRetentionBoundRestoredHistory() {
         let archive = PowerHistoryArchive(points: [point(0), point(86_400), point(86_402), point(86_404)])
         let core = PowerHistoryCore(archive: archive, now: date(86_404), maximumPoints: 2)

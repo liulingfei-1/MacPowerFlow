@@ -7,16 +7,19 @@ import SwiftUI
 final class AppDelegate: NSObject,
     NSApplicationDelegate,
     NSMenuDelegate,
-    NSPopoverDelegate
+    NSPopoverDelegate,
+    NSWindowDelegate
 {
     private let contentWidth: CGFloat = 420
-    private let maximumContentHeight: CGFloat = 720
+    private let maximumContentHeight: CGFloat = 660
     private let model = PowerMonitor()
     private let popover = NSPopover()
     private let contextMenu = NSMenu()
 
     private var statusItem: NSStatusItem?
     private var previewWindow: NSWindow?
+    private var detailWindow: NSWindow?
+    private let detailNavigation = DetailNavigation()
     private var launchAtLoginItem: NSMenuItem?
     private var modelObservation: AnyCancellable?
     private var pendingStatusUpdate: DispatchWorkItem?
@@ -26,6 +29,8 @@ final class AppDelegate: NSObject,
         ProcessInfo.processInfo.arguments.contains("--preview")
             || isChargingPreview
             || isAboutPreview
+            || ProcessInfo.processInfo.arguments.contains("--audit-ui")
+            || ProcessInfo.processInfo.arguments.contains("--verify-integration")
     }
 
     private var isChargingPreview: Bool {
@@ -56,6 +61,54 @@ final class AppDelegate: NSObject,
             )
         }
         updateStatusItem()
+
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--verify-integration") {
+            guard ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--data-directory=") }) else {
+                print("FAIL: isolated --data-directory is required")
+                NSApp.terminate(nil)
+                return
+            }
+            Task { @MainActor in
+                do {
+                    let checks = try await model.verifyLifecycleForTesting()
+                    checks.forEach { print("PASS: \($0)") }
+                    print("PASS: integration complete")
+                } catch { print("FAIL: integration \(error)") }
+                NSApp.terminate(nil)
+            }
+            return
+        }
+        #endif
+
+        if ProcessInfo.processInfo.arguments.contains("--audit-ui") {
+            model.setActivityRequested(true)
+            model.powerControls.refreshWhenVisible(true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 22) { [weak self] in
+                guard let self,
+                      let argument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--render-directory=") }) else { return }
+                let directory = URL(fileURLWithPath: String(argument.dropFirst("--render-directory=".count)), isDirectory: true)
+                do {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    for scheme in [ColorScheme.dark, .light] {
+                        let suffix = scheme == .dark ? "dark" : "light"
+                        self.renderAuditView(EnergyFlowView(model: self.model).environment(\.colorScheme, scheme),
+                                             size: NSSize(width: 420, height: 660),
+                                             to: directory.appendingPathComponent("overview-\(suffix).png"), scheme: scheme)
+                        for section in DetailSection.allCases {
+                            self.detailNavigation.selection = section
+                            let view = DetailWindowView(model: self.model, navigation: self.detailNavigation,
+                                                        toggleLogin: {}, loginStatus: { "预览 · 不更改登录设置" })
+                                .environment(\.colorScheme, scheme)
+                            self.renderAuditView(view, size: NSSize(width: 980, height: 760),
+                                                 to: directory.appendingPathComponent("\(section.rawValue)-\(suffix).png"), scheme: scheme)
+                        }
+                    }
+                    print("Rendered current live samples to \(directory.path)")
+                } catch { print("Render failed: \(error.localizedDescription)") }
+                NSApp.terminate(nil)
+            }
+        }
 
         if ProcessInfo.processInfo.arguments.contains("--diagnose-startup") {
             // Uses the ordinary automatic startup path, including the silent
@@ -124,6 +177,20 @@ final class AppDelegate: NSObject,
         false
     }
 
+    private func renderAuditView<V: View>(_ view: V, size: NSSize, to url: URL, scheme: ColorScheme) {
+        let host = NSHostingView(rootView: view)
+        host.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            if let png = bitmap.representation(using: .png, properties: [:]) { try? png.write(to: url) }
+        }
+        window.orderOut(nil)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         pendingStatusUpdate?.cancel()
         pendingLaunchAtLoginStatusUpdate?.cancel()
@@ -171,6 +238,13 @@ final class AppDelegate: NSObject,
 
     private func configureContextMenu() {
         contextMenu.delegate = self
+        let detailItem = NSMenuItem(title: "打开详细窗口", action: #selector(openDetailWindow(_:)), keyEquivalent: "d")
+        detailItem.target = self
+        contextMenu.addItem(detailItem)
+        let settingsItem = NSMenuItem(title: "设置与节能…", action: #selector(openSettingsWindow(_:)), keyEquivalent: ",")
+        settingsItem.target = self
+        contextMenu.addItem(settingsItem)
+        contextMenu.addItem(.separator())
 
         let refreshItem = NSMenuItem(
             title: "立即刷新",
@@ -522,14 +596,9 @@ final class AppDelegate: NSObject,
     }
 
     private func makeRootView(height: CGFloat) -> some View {
-        ZStack {
-            Color(nsColor: .windowBackgroundColor)
-                .ignoresSafeArea()
-            EnergyFlowView(model: model)
-        }
-        .frame(width: contentWidth, height: height)
-        .environment(\.colorScheme, .dark)
-        .preferredColorScheme(.dark)
+        AppAppearance { [model, weak self] in
+            EnergyFlowView(model: model, openDetails: { section in self?.showDetails(section) })
+        }.frame(width: contentWidth, height: height)
     }
 
     private func showPreviewWindow() {
@@ -545,7 +614,8 @@ final class AppDelegate: NSObject,
             backing: .buffered,
             defer: false
         )
-        model.setPanelVisible(true)
+        model.setPanelVisible(true, surface: "preview")
+        window.delegate = self
         window.title = "MacPowerFlow"
         window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(
@@ -574,6 +644,73 @@ final class AppDelegate: NSObject,
         } else {
             togglePopover(relativeTo: sender)
         }
+    }
+
+    @objc private func openDetailWindow(_ sender: Any?) { showDetails(.activity) }
+    @objc private func openSettingsWindow(_ sender: Any?) { showDetails(.settings) }
+
+    func openDetailSection(_ section: DetailSection) { showDetails(section) }
+
+    private func showDetails(_ section: DetailSection) {
+        detailNavigation.selection = section
+        if detailWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 760),
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                  backing: .buffered, defer: false)
+            window.title = "MacPowerFlow"
+            window.minSize = NSSize(width: 760, height: 560)
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.setFrameAutosaveName("MacPowerFlowDetails")
+            window.contentViewController = NSHostingController(rootView: AppAppearance { [model, detailNavigation, weak self] in
+                DetailWindowView(model: model, navigation: detailNavigation,
+                    toggleLogin: { self?.toggleLaunchAtLogin(nil) },
+                    loginStatus: {
+                        switch SMAppService.mainApp.status {
+                        case .enabled: "登录启动已开启"
+                        case .requiresApproval: "登录启动等待系统批准"
+                        default: "登录启动未开启"
+                        }
+                    }, isWindowVisible: { [weak self] in
+                        guard let window = self?.detailWindow else { return false }
+                        return window.isVisible && !window.isMiniaturized && !NSApp.isHidden
+                    })
+            })
+            window.center()
+            detailWindow = window
+        }
+        model.setPanelVisible(true, surface: "details")
+        model.setActivityRequested(section == .activity)
+        model.powerControls.refreshWhenVisible(section == .settings)
+        popover.performClose(nil)
+        detailWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window === detailWindow {
+            model.setPanelVisible(false, surface: "details")
+            model.setActivityRequested(false)
+        } else if window === previewWindow {
+            model.setPanelVisible(false, surface: "preview")
+        }
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window === detailWindow {
+            model.setPanelVisible(false, surface: "details")
+            model.setActivityRequested(false)
+        } else if window === previewWindow { model.setPanelVisible(false, surface: "preview") }
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window === detailWindow {
+            model.setPanelVisible(true, surface: "details")
+            model.setActivityRequested(detailNavigation.selection == .activity)
+        } else if window === previewWindow { model.setPanelVisible(true, surface: "preview") }
     }
 
     private func togglePopover(relativeTo button: NSStatusBarButton) {

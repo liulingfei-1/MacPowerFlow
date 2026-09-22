@@ -82,6 +82,11 @@ nonisolated struct PowerHistorySession: Codable, Equatable, Sendable, Identifiab
     let startedAt: Date
     var endedAt: Date?
     var summary: PowerHistorySummary
+    var elapsedSeconds: TimeInterval? { endedAt.map { max(0, $0.timeIntervalSince(startedAt)) } }
+    var coverageFraction: Double? {
+        guard let elapsedSeconds, elapsedSeconds > 0 else { return nil }
+        return min(1, max(0, summary.coveredSeconds / elapsedSeconds))
+    }
 }
 
 nonisolated struct PowerHistoryArchive: Codable, Sendable {
@@ -213,11 +218,68 @@ nonisolated struct PowerHistoryCore: Sendable {
         }
     }
 
-    func jsonData() throws -> Data {
+    func jsonData() throws -> Data { try Self.encodeArchive(archive) }
+
+    static func encodeArchive(_ archive: PowerHistoryArchive) throws -> Data {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .millisecondsSince1970
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.outputFormatting = [.sortedKeys]
         return try encoder.encode(archive)
+    }
+
+    /// Keep segment boundaries and both extrema of each chronological bucket.
+    /// The target is soft: preserving many discontinuities can exceed it.
+    static func chartPoints(points: [PowerHistoryPoint], targetCount: Int = 400,
+                            maximumGapSeconds: TimeInterval = 12) -> [PowerHistoryPoint] {
+        var annotated = points
+        var mandatory = Set<Int>()
+        var segments: [[Int]] = []
+        var current: [Int] = []
+        func closeSegment() {
+            if !current.isEmpty { segments.append(current); current = [] }
+        }
+        for index in points.indices {
+            let point = points[index]
+            let available = point.quality.canIntegrate && point.systemWatts.map { $0.isFinite && $0 >= 0 } == true
+            guard available else {
+                closeSegment()
+                // One representative per missing run preserves a visible break.
+                if index == 0 || (points[index - 1].quality.canIntegrate && points[index - 1].systemWatts != nil) {
+                    mandatory.insert(index)
+                }
+                continue
+            }
+            if let previous = current.last,
+               point.startsNewSegment || point.source != points[previous].source ||
+                point.timestamp.timeIntervalSince(points[previous].timestamp) > maximumGapSeconds {
+                closeSegment()
+            }
+            current.append(index)
+        }
+        closeSegment()
+        for segment in segments {
+            if let first = segment.first {
+                mandatory.insert(first)
+                annotated[first].startsNewSegment = true
+            }
+            if let last = segment.last { mandatory.insert(last) }
+        }
+        // Continuity is determined from the original full-rate sequence. The UI
+        // must not reapply the timeout to the now naturally farther-apart points.
+        guard points.count > max(2, targetCount) else { return annotated }
+        let remaining = max(0, targetCount - mandatory.count)
+        let total = max(1, segments.reduce(0) { $0 + $1.count })
+        for segment in segments where segment.count > 2 {
+            // At least one extrema pair per segment, even below the soft budget.
+            let buckets = max(1, remaining * segment.count / total / 2)
+            let bucketSize = max(1, Int(ceil(Double(segment.count) / Double(buckets))))
+            for start in stride(from: 0, to: segment.count, by: bucketSize) {
+                let bucket = segment[start..<min(start + bucketSize, segment.count)]
+                if let minimum = bucket.min(by: { points[$0].systemWatts! < points[$1].systemWatts! }) { mandatory.insert(minimum) }
+                if let maximum = bucket.max(by: { points[$0].systemWatts! < points[$1].systemWatts! }) { mandatory.insert(maximum) }
+            }
+        }
+        return mandatory.sorted().map { annotated[$0] }
     }
 
     static func decodeArchive(_ data: Data) throws -> PowerHistoryArchive {

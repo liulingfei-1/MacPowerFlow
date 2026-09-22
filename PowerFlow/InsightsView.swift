@@ -29,13 +29,13 @@ struct InsightsView: View {
                 }.padding(.top, 12)
             }
         }
-        .font(.system(size: 11))
-        .foregroundStyle(.white.opacity(0.85))
+        .font(.system(size: 13))
+        .foregroundStyle(.primary)
         .padding(12)
-        .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 13))
+        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 13))
     }
 
-    private var charging: some View {
+    var charging: some View {
         VStack(alignment: .leading, spacing: 7) {
             title("充电诊断", "powerplug")
             if let battery = model.latestBattery {
@@ -60,7 +60,7 @@ struct InsightsView: View {
         }
     }
 
-    private var quality: some View {
+    var quality: some View {
         VStack(alignment: .leading, spacing: 7) {
             title("读数与来源", "waveform.path.ecg")
             row("整机来源", model.powerSourceLabel)
@@ -82,7 +82,7 @@ struct InsightsView: View {
         }
     }
 
-    private var memory: some View {
+    var memory: some View {
         VStack(alignment: .leading, spacing: 7) {
             title("内存状态", "memorychip")
             if let memory = model.insights?.memory {
@@ -94,13 +94,14 @@ struct InsightsView: View {
         }
     }
 
-    private var activity: some View {
+    var activity: some View {
         VStack(alignment: .leading, spacing: 7) {
             title("耗电原因 · 活动指标", "list.bullet.rectangle")
             if let insights = model.insights {
                 row("物理网卡 接收 / 发送", "\(rate(insights.network?.readBytesPerSecond)) / \(rate(insights.network?.writeBytesPerSecond))")
                 row("物理磁盘 读取 / 写入", "\(rate(insights.disk?.readBytesPerSecond)) / \(rate(insights.disk?.writeBytesPerSecond))")
                 Text("高 CPU 进程 · 单核100%") .foregroundStyle(.secondary)
+                if !model.processDataReady { Text(model.processStatusText).foregroundStyle(.secondary) }
                 ForEach(insights.topProcesses ?? []) { process in
                     row(process.name, process.cpuPercent.map { String(format: "%.1f%%", $0) } ?? "建立基线")
                 }
@@ -150,11 +151,22 @@ struct InsightsView: View {
     private func rate(_ value: Double?) -> String { value == nil ? "—" : bytes(value) + "/s" }
 }
 
-private struct HistoryChartPoint: Identifiable {
+struct HistoryChartPoint: Identifiable {
     let timestamp: Date
     let watts: Double
     let segment: Int
     var id: Date { timestamp }
+}
+
+func historyChartPoints(_ points: [PowerHistoryPoint]) -> [HistoryChartPoint] {
+    var segment = 0
+    var result: [HistoryChartPoint] = []
+    for point in points {
+        guard point.quality.canIntegrate, let watts = point.systemWatts else { segment += 1; continue }
+        if point.startsNewSegment { segment += 1 }
+        result.append(HistoryChartPoint(timestamp: point.timestamp, watts: watts, segment: segment))
+    }
+    return result
 }
 
 struct HistoryPanel: View {
@@ -162,24 +174,13 @@ struct HistoryPanel: View {
     @State private var duration: Double = 900
     @State private var sessionName = "任务"
     @State private var exportMessage = ""
+    @State private var exporting = false
+    @State private var comparisonA: UUID?
+    @State private var comparisonB: UUID?
 
     private var since: Date { (history.points.last?.timestamp ?? Date()).addingTimeInterval(-duration) }
     private var plotted: [HistoryChartPoint] {
-        let points = history.points.filter { $0.timestamp >= since }
-        let step = max(1, points.count / 240)
-        var segment = 0
-        var previous: PowerHistoryPoint?
-        var result: [HistoryChartPoint] = []
-        for (index, point) in points.enumerated() {
-            defer { previous = point }
-            guard point.quality.canIntegrate, let watts = point.systemWatts else { segment += 1; continue }
-            let boundary = point.startsNewSegment || previous.map { point.timestamp.timeIntervalSince($0.timestamp) > 12 || $0.source != point.source } == true
-            if boundary { segment += 1 }
-            if index % step == 0 || boundary || index == points.count - 1 {
-                result.append(HistoryChartPoint(timestamp: point.timestamp, watts: watts, segment: segment))
-            }
-        }
-        return result
+        historyChartPoints(history.chartPoints(since: since, targetCount: 400))
     }
 
     var body: some View {
@@ -193,11 +194,12 @@ struct HistoryPanel: View {
             Chart(plotted) { point in
                 LineMark(x: .value("时间", point.timestamp), y: .value("瓦", point.watts), series: .value("连续段", point.segment))
                     .foregroundStyle(.green)
-            }.frame(height: 112).chartYAxisLabel("W")
+            }.frame(height: 190).chartYAxisLabel("W")
+                .chartXScale(domain: since...Date())
                 .chartXAxis {
                     AxisMarks(values: .automatic(desiredCount: 3)) { _ in
                         AxisGridLine()
-                        AxisValueLabel(format: .dateTime.hour().minute(), anchor: .top)
+                        AxisValueLabel(format: .dateTime.hour().minute())
                     }
                 }
                 .accessibilityLabel("整机功率历史；缺失时段断开")
@@ -213,38 +215,85 @@ struct HistoryPanel: View {
                     Button("开始记录") { history.startSession(name: sessionName) }
                 }
             }
-            ForEach(history.sessions.suffix(3).reversed()) { session in
+            sessionComparison
+            ForEach(history.sessions.suffix(10).reversed()) { session in
                 Text("\(session.name) · \(String(format: "%.3f", session.summary.energyWh)) Wh · 有效 \(Int(session.summary.coveredSeconds)) 秒")
                     .foregroundStyle(.secondary)
             }
             HStack {
                 Button("导出 CSV") { export(json: false) }
                 Button("导出 JSON") { export(json: true) }
-            }
+                if exporting { ProgressView().controlSize(.small) }
+            }.disabled(exporting)
             Text("本机保存最多24小时 / 20,000点；能耗为有效时段积分估算，不填补休眠或缺失时段。")
                 .foregroundStyle(.secondary)
             if let error = history.persistenceError { Text(error).foregroundStyle(.orange) }
             if !exportMessage.isEmpty { Text(exportMessage).foregroundStyle(.secondary) }
         }
     }
+    private var sessionComparison: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if history.sessions.count >= 2 {
+                Text("比较两次任务").font(.headline)
+                HStack {
+                    sessionPicker("任务 A", selection: $comparisonA)
+                    sessionPicker("任务 B", selection: $comparisonB)
+                }
+                if let a = history.sessions.first(where: { $0.id == comparisonA }),
+                   let b = history.sessions.first(where: { $0.id == comparisonB }) {
+                    if a.id == b.id {
+                        Text("请选择两个不同的任务").foregroundStyle(.secondary)
+                    } else {
+                        Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 7) {
+                            GridRow { Text(""); Text("A"); Text("B") }
+                            GridRow { Text("有效能耗"); Text(String(format: "%.3f Wh", a.summary.energyWh)); Text(String(format: "%.3f Wh", b.summary.energyWh)) }
+                            GridRow { Text("耗时"); Text(durationText(a.elapsedSeconds)); Text(durationText(b.elapsedSeconds)) }
+                            GridRow { Text("有效覆盖"); Text(coverage(a.coverageFraction)); Text(coverage(b.coverageFraction)) }
+                            GridRow { Text("平均功率"); Text(a.summary.averageWatts.map { String(format: "%.1f W", $0) } ?? "—"); Text(b.summary.averageWatts.map { String(format: "%.1f W", $0) } ?? "—") }
+                        }.monospacedDigit()
+                        Text("请比较相同工作量和相近条件；缺失时段未计入能耗，瞬时功率更低不一定更省电。")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+    private func sessionPicker(_ label: String, selection: Binding<UUID?>) -> some View {
+        Picker(label, selection: selection) {
+            Text("选择任务").tag(Optional<UUID>.none)
+            ForEach(history.sessions.reversed()) { session in
+                Text("\(session.name) · \(session.startedAt.formatted(date: .abbreviated, time: .shortened))")
+                    .tag(Optional(session.id))
+            }
+        }
+    }
+    private func coverage(_ value: Double?) -> String { value.map { String(format: "%.0f%%", $0 * 100) } ?? "—" }
+    private func durationText(_ value: Double?) -> String { value.map { String(format: "%.1f 分钟", $0 / 60) } ?? "—" }
+
     private func export(json: Bool) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [json ? .json : .commaSeparatedText]
         panel.nameFieldStringValue = "MacPowerFlow-history.\(json ? "json" : "csv")"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let data = try json ? history.jsonData() : history.csvData()
-            try data.write(to: url, options: .atomic)
-            exportMessage = "已导出 \(url.lastPathComponent)"
-        } catch { exportMessage = "导出失败：\(error.localizedDescription)" }
+        exporting = true
+        Task {
+            defer { exporting = false }
+            do {
+                let data: Data
+                if json { data = try await history.jsonDataAsync() }
+                else { data = await history.csvDataAsync() }
+                try await Task.detached(priority: .utility) { try data.write(to: url, options: .atomic) }.value
+                exportMessage = "已导出 \(url.lastPathComponent)"
+            } catch { exportMessage = "导出失败：\(error.localizedDescription)" }
+        }
     }
 }
 
-private struct AlertPanel: View {
+struct AlertPanel: View {
     @ObservedObject var alerts: PowerAlerts
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Toggle("持续异常时通知", isOn: Binding(get: { alerts.enabled }, set: { alerts.setEnabled($0) }))
+            Toggle("持续异常时通知", isOn: Binding(get: { alerts.requestedEnabled }, set: { alerts.setEnabled($0) }))
             HStack {
                 Text("高功耗阈值")
                 TextField("瓦", value: $alerts.highPowerThreshold, format: .number).frame(width: 60)
@@ -257,7 +306,7 @@ private struct AlertPanel: View {
     }
 }
 
-private struct DiagnosticsPanel: View {
+struct DiagnosticsPanel: View {
     @ObservedObject var diagnostics: AppDiagnostics
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {

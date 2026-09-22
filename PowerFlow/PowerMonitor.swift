@@ -45,9 +45,14 @@ nonisolated enum AdministratorSamplingState: Sendable, Equatable {
 /// UI thread. This object only publishes completed Sendable snapshots.
 @MainActor
 final class PowerMonitor: ObservableObject {
-    let history = PowerHistoryStore()
+    let history: PowerHistoryStore
     let diagnostics = AppDiagnostics()
-    let alerts = PowerAlerts()
+    let alerts: PowerAlerts
+    let energyInsights: EnergyInsightsStore
+    let powerControls = PowerControls()
+    @Published private(set) var fans: [FanSnapshot]?
+    @Published private(set) var lowPowerControlMessage = ""
+    @Published private(set) var lowPowerControlBusy = false
     @Published private(set) var insights: SystemInsightsSnapshot?
     @Published private(set) var latestBattery: BatterySnapshot?
     @Published private(set) var powerAvailability: Set<String> = []
@@ -61,6 +66,15 @@ final class PowerMonitor: ObservableObject {
     @Published private(set) var panelVisible = false
     private let insightsSampler = SystemInsightsSampler()
     private var lifecycleObservers: [NSObjectProtocol] = []
+    private var systemObservers: [NSObjectProtocol] = []
+    private var historyObservation: AnyCancellable?
+    private var visibleSurfaces = Set<String>()
+    private var activityRequested = false
+    private var lastHealthRecord = Date.distantPast
+    private var wakeEndpointPending = false
+    private var observedExternalPower: Bool?
+    private var lifecycleGeneration = UUID()
+    private var initialActivitySamples = 0
     private var suspended = false
     private var nextEnhancedRetry = Date.distantPast
     private var enhancedRetryCount = 0
@@ -84,10 +98,70 @@ final class PowerMonitor: ObservableObject {
         if panelVisible || history.activeSession != nil { return 2 }
         return lowPowerModeEnabled ? 10 : 5
     }
-    func setPanelVisible(_ value: Bool) {
-        panelVisible = value
-        diagnostics.updateState(panelVisible: value, enhancedSampling: administratorSampleIsFresh)
+    func setPanelVisible(_ value: Bool, surface: String = "popover") {
+        if value { visibleSurfaces.insert(surface) } else { visibleSurfaces.remove(surface) }
+        let visible = !visibleSurfaces.isEmpty
+        if panelVisible != visible { panelVisible = visible }
+        diagnostics.updateState(panelVisible: visible, enhancedSampling: administratorSampleIsFresh)
+        synchronizeSamplingInterval()
         if value { refreshNow() }
+    }
+
+    func setActivityRequested(_ value: Bool) {
+        guard activityRequested != value else { return }
+        activityRequested = value
+        if value { initialActivitySamples = 0 }
+        lastProcessRefresh = .distantPast
+        if value { refreshNow() }
+    }
+
+    var processDataReady: Bool {
+        guard let insights, Date().timeIntervalSince(insights.timestamp) < 25,
+              let processes = insights.topProcesses else { return false }
+        return processes.isEmpty || processes.contains { $0.cpuPercent != nil }
+    }
+    var processStatusText: String { processDataReady ? "当前没有可列出的进程" : "正在建立进程采样基线" }
+    var processStatusSymbol: String { processDataReady ? "list.bullet" : "clock" }
+    var enhancedIntervalSeconds: Int { privilegedPowerSampler.samplingIntervalSeconds }
+
+    private func synchronizeSamplingInterval() {
+        let interval = Int(samplingIntervalSeconds)
+        guard interval != privilegedPowerSampler.samplingIntervalSeconds else { return }
+        administratorLastUpdated = .distantPast
+        administratorSampleCount = 0
+        administratorWindowStart = nil
+        history.breakContinuity()
+        _ = privilegedPowerSampler.setSamplingInterval(seconds: interval)
+        if isSampling && !suspended { restartMonitoringTimer() }
+    }
+
+    func setLowPowerMode(source: LowPowerModeSource, enabled: Bool) {
+        guard !lowPowerControlBusy else { return }
+        lowPowerControlBusy = true
+        lowPowerControlMessage = "正在应用并核对系统设置…"
+        privilegedPowerSampler.setLowPowerMode(source: source, enabled: enabled) { [weak self] actual, error in
+            guard let self else { return }
+            self.lowPowerControlBusy = false
+            if let actual {
+                self.lowPowerControlMessage = "\(source == .battery ? "使用电池" : "接通电源")时低功耗已\(actual ? "开启" : "关闭")，已回读确认"
+            } else {
+                self.lowPowerControlMessage = error ?? "未能确认设置，请打开系统电池设置检查"
+            }
+            self.updateSystemState()
+            self.synchronizeSamplingInterval()
+            self.powerControls.refreshWhenVisible(true, force: true)
+        }
+    }
+
+    private func batteryInsight(_ battery: BatterySnapshot) -> BatteryInsightSample {
+        BatteryInsightSample(date: battery.observedAt, isPresent: battery.isPresent,
+            isOnAC: battery.isOnAC, level: battery.reportedLevel,
+            currentCapacityMAh: battery.reportedCurrentCapacityMAh,
+            fullCapacityMAh: battery.fullCapacityMAh > 0 ? battery.fullCapacityMAh : nil,
+            designCapacityMAh: battery.designCapacityMAh > 0 ? battery.designCapacityMAh : nil,
+            cycleCount: battery.reportedCycleCount,
+            temperatureC: battery.temperatureC > 0 ? battery.temperatureC : nil,
+            voltage: battery.batteryVoltage > 0 ? battery.batteryVoltage : nil)
     }
     private func installLifecycleObservers() {
         guard lifecycleObservers.isEmpty else { return }
@@ -95,22 +169,46 @@ final class PowerMonitor: ObservableObject {
         lifecycleObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.lifecycleGeneration = UUID()
                 self.suspended = true
+                self.monitoringTask?.cancel()
+                self.monitoringTask = nil
+                // Read only the battery at the sleep boundary; a cached UI sample
+                // may be up to ten seconds old. No full IOReport/process scan.
+                self.energyInsights.willSleep(self.batteryInsight(BatteryReader.read()))
+                self.refreshTask?.cancel()
+                self.refreshTask = nil
+                self.processTask?.cancel()
+                self.processTask = nil
                 self.history.breakContinuity()
-                self.history.flush()
+                self.wakeEndpointPending = true
+                self.history.saveInBackground()
                 self.privilegedPowerSampler.stop()
             }
         })
+        for name in [Notification.Name.NSProcessInfoPowerStateDidChange, ProcessInfo.thermalStateDidChangeNotification] {
+            systemObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.updateSystemState()
+                    self?.synchronizeSamplingInterval()
+                    self?.refreshNow()
+                }
+            })
+        }
         lifecycleObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                let generation = self.lifecycleGeneration
                 await self.hardwareSampler.resetBaseline()
                 await self.insightsSampler.reset()
+                guard !Task.isCancelled, self.isSampling, self.lifecycleGeneration == generation else { return }
                 self.history.breakContinuity()
                 self.suspended = false
                 self.enhancedRetryCount = 0
                 self.nextEnhancedRetry = .distantPast
                 self.lastProcessRefresh = .distantPast
+                self.initialActivitySamples = 0
+                self.restartMonitoringTimer()
                 self.refreshNow()
             }
         })
@@ -255,6 +353,13 @@ final class PowerMonitor: ObservableObject {
     private var administratorTerminalError: String?
 
     init() {
+        // Diagnostic launches may opt into a separate local data directory so
+        // two app processes never overwrite the user's running history.
+        let directory = ProcessInfo.processInfo.arguments.first { $0.hasPrefix("--data-directory=") }
+            .map { URL(fileURLWithPath: String($0.dropFirst("--data-directory=".count)), isDirectory: true) }
+        history = PowerHistoryStore(fileURL: directory?.appendingPathComponent("power-history-v1.json"))
+        energyInsights = EnergyInsightsStore(fileURL: directory?.appendingPathComponent("energy-insights-v1.json"))
+        alerts = PowerAlerts(preferences: directory == nil ? .standard : UserDefaults(suiteName: "com.llf.MacPowerFlow.preview")!)
         chipName = Self.sysctlString("machdep.cpu.brand_string")
         if chipName.isEmpty {
             chipName = Self.sysctlString("hw.model")
@@ -264,6 +369,12 @@ final class PowerMonitor: ObservableObject {
         }
 
         updateSystemState()
+        historyObservation = history.$activeSession.map { $0?.id }.removeDuplicates().dropFirst()
+            .receive(on: RunLoop.main).sink { [weak self] _ in
+                self?.synchronizeSamplingInterval()
+                self?.lastProcessRefresh = .distantPast
+                self?.refreshNow()
+            }
     }
 
     deinit {
@@ -278,7 +389,7 @@ final class PowerMonitor: ObservableObject {
     func startMonitoring(
         automaticallyStartAdministrator: Bool = true
     ) {
-        guard monitoringTask == nil else { return }
+        guard !isSampling else { return }
 
         automaticEnhancedSampling = automaticallyStartAdministrator
         isSampling = true
@@ -286,12 +397,20 @@ final class PowerMonitor: ObservableObject {
         installLifecycleObservers()
         history.breakContinuity()
         diagnostics.start()
+        alerts.restorePreferences()
+        synchronizeSamplingInterval()
         installPowerSourceWatcherIfNeeded()
         refreshNow()
         if automaticallyStartAdministrator {
             startAdministratorSampling()
         }
 
+        restartMonitoringTimer()
+    }
+
+    private func restartMonitoringTimer() {
+        monitoringTask?.cancel()
+        guard isSampling, !suspended else { monitoringTask = nil; return }
         monitoringTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 do {
@@ -306,6 +425,7 @@ final class PowerMonitor: ObservableObject {
     }
 
     func stopMonitoring() {
+        lifecycleGeneration = UUID()
         monitoringTask?.cancel()
         monitoringTask = nil
 
@@ -320,8 +440,11 @@ final class PowerMonitor: ObservableObject {
         removePowerSourceWatcher()
         lifecycleObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
         lifecycleObservers.removeAll()
+        systemObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        systemObservers.removeAll()
         history.breakContinuity()
         history.flush()
+        energyInsights.flush()
         diagnostics.stop()
         privilegedPowerSampler.stop()
 
@@ -390,6 +513,11 @@ final class PowerMonitor: ObservableObject {
                     .fromOpaque(rawContext)
                     .takeUnretainedValue()
                 Task { @MainActor in
+                    let battery = BatteryReader.read()
+                    if let previous = monitor.observedExternalPower, previous != battery.isOnAC {
+                        monitor.energyInsights.notePowerSourceChange()
+                    }
+                    monitor.observedExternalPower = battery.isOnAC
                     monitor.refreshNow()
                 }
             },
@@ -682,7 +810,7 @@ final class PowerMonitor: ObservableObject {
         return administratorSamplingState == .active
             && administratorLastUpdated != Date.distantPast
             && age >= 0
-            && age < 8
+            && age < max(8, Double(privilegedPowerSampler.samplingIntervalSeconds) * 2.5)
     }
 
     private func scheduleAdministratorStartupWatchdog() {
@@ -738,6 +866,16 @@ final class PowerMonitor: ObservableObject {
             smc: snapshot.smcValues
         )
         updateSystemState()
+        synchronizeSamplingInterval()
+        fans = snapshot.fans
+        if wakeEndpointPending {
+            wakeEndpointPending = false
+            energyInsights.didWake(batteryInsight(snapshot.battery))
+        }
+        if Date().timeIntervalSince(lastHealthRecord) >= 60 {
+            lastHealthRecord = Date()
+            energyInsights.record(batteryInsight(snapshot.battery))
+        }
         scheduleProcessRefreshIfNeeded()
 
         lastUpdated = Date()
@@ -784,6 +922,10 @@ final class PowerMonitor: ObservableObject {
         from snapshot: BatterySnapshot,
         smc: [String: Double]
     ) {
+        if let previous = observedExternalPower, previous != snapshot.isOnAC {
+            energyInsights.notePowerSourceChange()
+        }
+        observedExternalPower = snapshot.isOnAC
         batteryPresent = snapshot.isPresent
         batteryLevel = snapshot.isPresent ? snapshot.level : -1
         latestBattery = snapshot
@@ -1170,13 +1312,15 @@ final class PowerMonitor: ObservableObject {
 
     private func scheduleProcessRefreshIfNeeded() {
         let now = Date()
-        guard processTask == nil, now.timeIntervalSince(lastProcessRefresh) >= processInterval else { return }
+        let interval = activityRequested && initialActivitySamples < 3 ? 2 : processInterval
+        guard processTask == nil, now.timeIntervalSince(lastProcessRefresh) >= interval else { return }
         lastProcessRefresh = now
         let sampler = insightsSampler
         processTask = Task { @MainActor [weak self] in
-            let result = await sampler.sample(includeDetails: (self?.panelVisible ?? false) || self?.history.activeSession != nil)
+            let result = await sampler.sample(includeDetails: (self?.activityRequested ?? false) || self?.history.activeSession != nil)
             guard !Task.isCancelled, let self else { return }
             self.insights = result
+            if self.activityRequested { self.initialActivitySamples += 1 }
             self.topProcesses = (result.topProcesses ?? []).prefix(3).compactMap {
                 guard let cpu = $0.cpuPercent else { return nil }
                 return ActivityProcess(id: Int($0.pid), name: $0.name, cpuPercent: cpu)
@@ -1186,6 +1330,56 @@ final class PowerMonitor: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    #if DEBUG
+    /// Local-only integration fixture. Posts app-process notifications; it never
+    /// sleeps the computer or changes power settings. Use an isolated data directory.
+    func verifyLifecycleForTesting() async throws -> [String] {
+        struct CheckFailure: Error { let message: String }
+        func check(_ condition: Bool, _ message: String) throws {
+            if !condition { throw CheckFailure(message: message) }
+        }
+        var checks: [String] = []
+        setPanelVisible(true, surface: "test-window")
+        setPanelVisible(true)
+        setPanelVisible(false)
+        try check(panelVisible && samplingIntervalSeconds == 2, "closing popover must keep detail cadence")
+        setPanelVisible(false, surface: "test-window")
+        try check(!panelVisible && samplingIntervalSeconds >= 5, "last window closed must restore background")
+        setPanelVisible(true, surface: "test-window")
+        try await Task.sleep(for: .milliseconds(250))
+        let first = lastUpdated
+        try await Task.sleep(for: .milliseconds(2300))
+        try check(lastUpdated > first, "foreground cadence must not inherit old background wait")
+        checks.append("window visibility and immediate timer reschedule")
+        setPanelVisible(false, surface: "test-window")
+        history.startSession(name: "Integration fixture")
+        try await Task.sleep(for: .milliseconds(100))
+        try check(enhancedIntervalSeconds == 2, "task recording must select 2 seconds")
+        history.endSession()
+        try await Task.sleep(for: .milliseconds(100))
+        try check(enhancedIntervalSeconds >= 5, "ending task must restore background cadence")
+        checks.append("task recording cadence")
+        let center = NSWorkspace.shared.notificationCenter
+        center.post(name: NSWorkspace.willSleepNotification, object: nil)
+        try await Task.sleep(for: .milliseconds(50))
+        try check(suspended && monitoringTask == nil, "sleep must cancel timer")
+        center.post(name: NSWorkspace.didWakeNotification, object: nil)
+        center.post(name: NSWorkspace.willSleepNotification, object: nil)
+        try await Task.sleep(for: .milliseconds(250))
+        try check(suspended && monitoringTask == nil, "old wake must not undo newer sleep")
+        center.post(name: NSWorkspace.didWakeNotification, object: nil)
+        try await Task.sleep(for: .milliseconds(350))
+        try check(!suspended && monitoringTask != nil, "wake must restart sampling")
+        checks.append("sleep/wake generation and baseline recovery")
+        stopMonitoring()
+        center.post(name: NSWorkspace.didWakeNotification, object: nil)
+        try await Task.sleep(for: .milliseconds(100))
+        try check(!isSampling && monitoringTask == nil, "stopped monitor must stay stopped")
+        checks.append("stop intent survives notifications")
+        return checks
+    }
+    #endif
 
     private func firstPositive(_ values: Double...) -> Double {
         for value in values {

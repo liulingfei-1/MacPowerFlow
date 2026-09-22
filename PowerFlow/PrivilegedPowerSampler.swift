@@ -1,5 +1,10 @@
 import Foundation
 
+nonisolated enum LowPowerModeSource: Int, Sendable {
+    case battery = 0
+    case adapter = 1
+}
+
 nonisolated enum PrivilegedThermalPressure: String, Sendable, Equatable {
     case nominal
     case light
@@ -60,7 +65,7 @@ final class PrivilegedPowerSampler {
 
     private static let maximumBufferBytes = 4 * 1_024 * 1_024
 
-    private let runner = MPFPrivilegedMetricsRunner()
+    private let runner: MPFPrivilegedMetricsRunner
     private var streamDecoder = PowerMetricsFrameDecoder()
     private var wantsSampling = false
     private var parsedSampleCount = 0
@@ -68,9 +73,16 @@ final class PrivilegedPowerSampler {
     private var sampleHandler: SampleHandler?
     private var stateHandler: StateHandler?
     private var startCompletion: StartCompletion?
+    private var streamGeneration = UUID()
+    private var restartingForInterval = false
+    private(set) var samplingIntervalSeconds = 2
 
     private(set) var state = PrivilegedPowerSamplerState.idle
     private(set) var latestSample: PrivilegedPowerSample?
+
+    init(runner: MPFPrivilegedMetricsRunner = MPFPrivilegedMetricsRunner()) {
+        self.runner = runner
+    }
 
     var isRunning: Bool {
         switch state {
@@ -96,6 +108,7 @@ final class PrivilegedPowerSampler {
         guard !wantsSampling, state != .stopping else { return false }
 
         wantsSampling = true
+        restartingForInterval = false
         parsedSampleCount = 0
         pendingTerminalError = nil
         latestSample = nil
@@ -107,10 +120,40 @@ final class PrivilegedPowerSampler {
         return true
     }
 
+    /// Changing cadence restarts the privileged process, not just the UI timer.
+    /// Only the fixed allowed values cross XPC. A stopped sampler stays stopped.
+    @discardableResult
+    func setSamplingInterval(seconds: Int) -> Bool {
+        guard [2, 5, 10].contains(seconds) else { return false }
+        guard samplingIntervalSeconds != seconds else { return true }
+        samplingIntervalSeconds = seconds
+        guard wantsSampling else { return true }
+        restartingForInterval = true
+        latestSample = nil
+        streamDecoder.reset(keepingCapacity: true)
+        setState(.stopping)
+        runner.stop()
+        return true
+    }
+
+    func queryLowPowerMode(source: LowPowerModeSource, completion: @escaping (Bool?, String?) -> Void) {
+        runner.queryLowPowerMode(source: source.rawValue) { success, enabled, message in
+            completion(success ? enabled : nil, message)
+        }
+    }
+
+    /// UI must call only for an explicit user action. No auto-install or prompt.
+    func setLowPowerMode(source: LowPowerModeSource, enabled: Bool, completion: @escaping (Bool?, String?) -> Void) {
+        runner.setLowPowerMode(source: source.rawValue, enabled: enabled) { success, actual, message in
+            completion(success ? actual : nil, message)
+        }
+    }
+
     func stop() {
         guard wantsSampling || state != .idle else { return }
 
         wantsSampling = false
+        restartingForInterval = false
         pendingTerminalError = nil
         runner.stop()
         streamDecoder.reset(keepingCapacity: false)
@@ -125,6 +168,7 @@ final class PrivilegedPowerSampler {
         }
 
         wantsSampling = false
+        restartingForInterval = false
         pendingTerminalError = message
         runner.stop()
         streamDecoder.reset(keepingCapacity: false)
@@ -133,14 +177,24 @@ final class PrivilegedPowerSampler {
 
     private func launchStream(allowInstallation: Bool) {
         guard wantsSampling else { return }
-
+        guard runner.configureSamplingInterval(samplingIntervalSeconds) else {
+            wantsSampling = false
+            setState(.failed("增强采样尚未停止，无法更改采样间隔。"))
+            finishStart("增强采样尚未停止，无法更改采样间隔。")
+            clearSessionCallbacks()
+            return
+        }
+        streamGeneration = UUID()
+        let generation = streamGeneration
         runner.startAllowingInstallation(
             allowInstallation,
             dataHandler: { [weak self] data in
-                self?.consume(data)
+                guard let self, self.streamGeneration == generation else { return }
+                self.consume(data)
             },
             stateHandler: { [weak self] runnerState, message in
-                self?.consume(runnerState, message: message)
+                guard let self, self.streamGeneration == generation else { return }
+                self.consume(runnerState, message: message)
             }
         )
     }
@@ -151,6 +205,14 @@ final class PrivilegedPowerSampler {
     ) {
         switch runnerState {
         case .idle:
+            if restartingForInterval && wantsSampling {
+                restartingForInterval = false
+                parsedSampleCount = 0
+                latestSample = nil
+                streamDecoder.reset(keepingCapacity: true)
+                launchStream(allowInstallation: false)
+                return
+            }
             let wasSampling = wantsSampling
             let terminalError = pendingTerminalError
             wantsSampling = false
@@ -205,7 +267,7 @@ final class PrivilegedPowerSampler {
     }
 
     private func consume(_ data: Data) {
-        guard wantsSampling else { return }
+        guard wantsSampling, !restartingForInterval else { return }
 
         guard let propertyListFrames = streamDecoder.append(
             data,
