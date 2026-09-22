@@ -31,7 +31,7 @@ static NSString * const MPFStagedInstallerPath =
     @"/Library/PrivilegedHelperTools/.com.llf.MacPowerFlow.PrivilegedInstaller.staging";
 static const char * const MPFSystemInstallPath = "/usr/bin/install";
 static NSTimeInterval const MPFConnectionTimeout = 8.0;
-static NSUInteger const MPFMatchingHelperRetryLimit = 3;
+static NSUInteger const MPFMatchingHelperRetryLimit = 15;
 static NSUInteger const MPFSamplingStartRetryLimit = 16;
 static NSInteger const MPFProtocolVersion = 1;
 static NSString * const MPFRetryableSessionBusyMarker =
@@ -44,6 +44,7 @@ static NSString * const MPFRetryableSessionBusyMarker =
     BOOL _workerActive;
     BOOL _stopRequested;
     BOOL _installAttempted;
+    BOOL _allowInstallation;
     BOOL _helperWasCompatible;
     NSUInteger _connectionGeneration;
     NSUInteger _compatibleGeneration;
@@ -87,7 +88,8 @@ static NSString * const MPFRetryableSessionBusyMarker =
         || state == MPFPrivilegedMetricsRunnerStateRunning;
 }
 
-- (void)startWithDataHandler:(MPFPrivilegedMetricsDataHandler)dataHandler
+- (void)startAllowingInstallation:(BOOL)allowInstallation
+                   dataHandler:(MPFPrivilegedMetricsDataHandler)dataHandler
                 stateHandler:(MPFPrivilegedMetricsStateHandler)stateHandler {
     NSParameterAssert(dataHandler != nil);
     NSParameterAssert(stateHandler != nil);
@@ -100,6 +102,7 @@ static NSString * const MPFRetryableSessionBusyMarker =
         _workerActive = YES;
         _stopRequested = NO;
         _installAttempted = NO;
+        _allowInstallation = allowInstallation;
         _helperWasCompatible = NO;
         _connectionFailureCount = 0;
         _matchingHelperRetryCount = 0;
@@ -135,6 +138,9 @@ static NSString * const MPFRetryableSessionBusyMarker =
 #pragma mark - XPC connection
 
 - (void)connectToInstalledHelper {
+    @synchronized (self) {
+        if (!_workerActive) { return; }
+    }
     if ([self isStopRequested]) {
         [self finishStopped];
         return;
@@ -150,14 +156,13 @@ static NSString * const MPFRetryableSessionBusyMarker =
         return;
     }
 
-    // On a true first launch (or after this exact app binary changes), there
-    // is no compatible helper to wake. Start the one-time approval flow
-    // immediately instead of making the user wait through an XPC timeout.
+    // Detect upgrades before connecting: the helper and the configured client
+    // identity must both match. Only explicit user actions may install/update.
     if (!_installAttempted
-            && _connectionGeneration == 0
-            && ![self codeAtURL:
+            && (![self codeAtURL:
                 [NSURL fileURLWithPath:MPFInstalledHelperPath]
-                matchesExactRequirement:helperRequirement]) {
+                matchesExactRequirement:helperRequirement]
+                || ![self installedConfigurationMatchesCurrentClient])) {
         _installAttempted = YES;
         [self installHelperAndReconnect];
         return;
@@ -368,11 +373,17 @@ static NSString * const MPFRetryableSessionBusyMarker =
                     < MPFMatchingHelperRetryLimit) {
             ++_matchingHelperRetryCount;
             NSTimeInterval delay =
-                0.35 + 0.25 * (double)_matchingHelperRetryCount;
+                MIN(2.0, 0.35 + 0.25 * (double)_matchingHelperRetryCount);
             [self scheduleConnectionRetryAfter:delay];
             return;
         }
 
+        // A matching helper may still be starting during login. A timeout
+        // does not prove an installation is broken; never reinstall it here.
+        if (installedHelperMatches) {
+            [self finishFailed:@"增强服务暂未响应，当前使用标准采样。可从右键菜单重试增强采样。"];
+            return;
+        }
         _installAttempted = YES;
         [self installHelperAndReconnect];
         return;
@@ -387,6 +398,7 @@ static NSString * const MPFRetryableSessionBusyMarker =
 }
 
 - (void)scheduleConnectionRetryAfter:(NSTimeInterval)delay {
+    NSUInteger generation = _connectionGeneration;
     dispatch_after(
         dispatch_time(
             DISPATCH_TIME_NOW,
@@ -394,6 +406,8 @@ static NSString * const MPFRetryableSessionBusyMarker =
         ),
         _workerQueue,
         ^{
+            // stop/failure/new sessions invalidate previously queued work.
+            if (generation != self->_connectionGeneration) { return; }
             [self connectToInstalledHelper];
         }
     );
@@ -450,6 +464,11 @@ static NSString * const MPFRetryableSessionBusyMarker =
 - (void)installHelperAndReconnect {
     if ([self isStopRequested]) {
         [self finishStopped];
+        return;
+    }
+
+    if (!_allowInstallation) {
+        [self finishFailed:@"增强服务需要安装或更新，当前使用标准采样。请从右键菜单选择“启用或更新增强采样…”完成一次授权。"];
         return;
     }
 
@@ -1039,6 +1058,24 @@ static NSString * const MPFRetryableSessionBusyMarker =
     }
     CFRelease(requirement);
     return status == errSecSuccess;
+}
+
+- (BOOL)installedConfigurationMatchesCurrentClient {
+    NSString *path = @"/Library/Application Support/com.llf.MacPowerFlow/helper-config.plist";
+    struct stat metadata = {0};
+    if (lstat(path.fileSystemRepresentation, &metadata) != 0
+            || !S_ISREG(metadata.st_mode) || metadata.st_uid != 0
+            || metadata.st_nlink != 1 || (metadata.st_mode & 0022) != 0) {
+        return NO;
+    }
+    NSDictionary *configuration = [NSDictionary dictionaryWithContentsOfURL:
+        [NSURL fileURLWithPath:path]];
+    NSError *error = nil;
+    NSString *requirement = [self exactRequirementForCurrentProcess:&error];
+    return requirement != nil
+        && [configuration[@"ConfigurationVersion"] isEqual:@1]
+        && [configuration[@"AllowedClientUID"] isEqual:@(getuid())]
+        && [configuration[@"ClientCodeSigningRequirement"] isEqual:requirement];
 }
 
 - (BOOL)validateStagedToolAtPath:(NSString *)path

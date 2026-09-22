@@ -21,7 +21,8 @@ typedef void (^MPFPrivilegedMetricsStateHandler)(
 
 /// Connects to MacPowerFlow's launchd-managed, read-only metrics helper.
 ///
-/// On the first launch of this exact app build, the runner requests one
+/// Only an explicit user action may allow installation. Automatic launches
+/// connect silently. When allowed, a new app build requests one
 /// Authorization Services grant to install the fixed helper. Later launches
 /// connect over a code-signing-constrained XPC service without requesting a
 /// password. No password is exposed to the app or added to sudoers. Both
@@ -31,7 +32,8 @@ typedef void (^MPFPrivilegedMetricsStateHandler)(
 @property (atomic, readonly) MPFPrivilegedMetricsRunnerState state;
 @property (atomic, readonly, getter=isRunning) BOOL running;
 
-- (void)startWithDataHandler:(MPFPrivilegedMetricsDataHandler)dataHandler
+- (void)startAllowingInstallation:(BOOL)allowInstallation
+                   dataHandler:(MPFPrivilegedMetricsDataHandler)dataHandler
                 stateHandler:(MPFPrivilegedMetricsStateHandler)stateHandler;
 
 /// Stops only the current powermetrics stream and closes the XPC connection.

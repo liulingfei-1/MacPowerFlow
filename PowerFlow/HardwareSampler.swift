@@ -5,6 +5,13 @@ import IOKit
 /// inside the sampler actor avoids moving an imported non-Sendable value across
 /// an isolation boundary.
 nonisolated struct ProcessorSnapshot: Sendable {
+    /// A supported domain can report a valid 0 W. Absence is never a zero.
+    let powerAvailability: Set<String>
+    let samplingWindowStart: TimeInterval
+    let samplingWindowEnd: TimeInterval
+    let sampleDuration: TimeInterval
+    let hasValidEnergySample: Bool
+    let sampleStatus: String
     let cpuPower: Double
     let gpuPower: Double
     let anePower: Double
@@ -176,7 +183,21 @@ actor HardwareSampler {
             }
         }
 
+        let domainNames = ["cpu", "gpu", "ane", "dram", "gpuSRAM", "media",
+                           "isp", "fabric", "pcie", "displaySoC", "displayExt"]
+        let availableDomains = Set(domainNames.enumerated().compactMap { index, name in
+            (report.powerAvailabilityMask & (UInt64(1) << index)) != 0 ? name : nil
+        })
+        let statusNames = ["unavailable", "baseline", "available", "reset"]
+        let statusIndex = Int(report.sampleStatus)
         let processor = ProcessorSnapshot(
+            powerAvailability: availableDomains,
+            samplingWindowStart: report.sampleStartTime,
+            samplingWindowEnd: report.sampleEndTime,
+            sampleDuration: report.sampleDuration,
+            hasValidEnergySample: report.hasValidEnergySample.boolValue,
+            sampleStatus: statusNames.indices.contains(statusIndex)
+                ? statusNames[statusIndex] : "unavailable",
             cpuPower: report.cpuPower,
             gpuPower: report.gpuPower,
             anePower: report.anePower,
@@ -268,6 +289,16 @@ actor HardwareSampler {
                 isNumeric: SMCDataTypeIsNumeric(keyInfo.dataType) != 0
             )
         }
+        // Give the same inventory to the temperature reader. A partial discovery
+        // leaves its bounded one-time fallback available instead of suppressing
+        // sensors merely because one key-info lookup failed.
+        if successfullyEnumeratedIndexCount == smcReportedKeyCount,
+           discovered.count == smcReportedKeyCount {
+            let temperatureKeys = discovered.values.filter {
+                $0.dataType == "flt " || $0.dataType == "sp78"
+            }.map(\.key).sorted()
+            IOReportWrapper.configureTemperatureKeys(temperatureKeys)
+        }
         smcCapabilities = discovered
         smcEnumeratedKeys = enumeratedKeys
         // Only a complete, uncapped #KEY walk proves that a key is absent.
@@ -293,7 +324,12 @@ actor HardwareSampler {
         return String(decoding: bytes, as: UTF8.self)
     }
 
+    func resetBaseline() {
+        IOReportWrapper.resetSamplingBaseline()
+    }
+
     func close() {
+        IOReportWrapper.resetSamplingBaseline()
         if smcConnection != 0 {
             SMCClose(smcConnection)
             smcConnection = 0

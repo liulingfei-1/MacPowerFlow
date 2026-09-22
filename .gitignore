@@ -21,3 +21,9 @@ xcuserdata/
 
 # Local QA duplicate retained in the workspace but not part of the release.
 design-qa 2.md
+
+# Local rollback archive; never publish installed binaries.
+backups/
+
+# Local device telemetry, runtime logs and verification screenshots.
+audit/

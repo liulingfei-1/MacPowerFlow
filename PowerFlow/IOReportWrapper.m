@@ -6,6 +6,8 @@
 #import <IOKit/hidsystem/IOHIDServiceClient.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
+#include <mach/mach_time.h>
 
 typedef struct IOReportSubscriptionRef *IOReportSubscriptionRef;
 #define MPF_WEAK_IMPORT __attribute__((weak_import))
@@ -55,6 +57,29 @@ static char gCpuTempKeys[64][5];
 static int gCpuTempKeyCount = 0;
 static char gGpuTempKeys[64][5];
 static int gGpuTempKeyCount = 0;
+static BOOL gTemperatureKeysLoaded = NO;
+static CFDictionaryRef gPreviousSample = NULL;
+static double gPreviousTime = 0, gPreviousWallTime = 0;
+static double gPreviousAwakeTime = 0;
+static double gNextSubscriptionAttempt = 0;
+static unsigned gSubscriptionFailures = 0;
+static unsigned gSampleFailures = 0;
+static const double kMaximumSampleGap = 30.0;
+
+static void clearBaseline(void) {
+    if (gPreviousSample != NULL) CFRelease(gPreviousSample);
+    gPreviousSample = NULL;
+    gPreviousTime = gPreviousWallTime = gPreviousAwakeTime = 0;
+}
+
+static void clearSubscription(void) {
+    clearBaseline();
+    if (gSubscription != NULL) CFRelease((CFTypeRef)gSubscription);
+    if (gChannels != NULL) CFRelease(gChannels);
+    gSubscription = NULL;
+    gChannels = NULL;
+}
+
 
 static BOOL ioReportFunctionsAvailable(void) {
     return IOReportCopyChannelsInGroup != NULL
@@ -139,11 +164,9 @@ static CFArrayRef ioReportChannelArray(CFTypeRef delta) {
 }
 
 static double monotonicSeconds(void) {
-    struct timespec timestamp = {0};
-    if (clock_gettime(CLOCK_MONOTONIC, &timestamp) != 0) {
-        return 0;
-    }
-    return (double)timestamp.tv_sec + (double)timestamp.tv_nsec / 1000000000.0;
+    mach_timebase_info_data_t timebase;
+    mach_timebase_info(&timebase);
+    return (double)mach_continuous_time() * timebase.numer / timebase.denom / 1e9;
 }
 
 static IOHIDEventSystemClientRef getHIDClient(void) {
@@ -207,11 +230,12 @@ static BOOL isValidTemperature(double value) {
 }
 
 static void loadTemperatureKeys(io_connect_t smcConn) {
-    if (smcConn == 0 || gCpuTempKeyCount > 0 || gGpuTempKeyCount > 0) {
+    if (smcConn == 0 || gTemperatureKeysLoaded) {
         return;
     }
 
-    int totalKeys = SMCGetKeyCount(smcConn);
+    gTemperatureKeysLoaded = YES;
+    int totalKeys = MIN(MAX(SMCGetKeyCount(smcConn), 0), 8192);
     for (int index = 0; index < totalKeys; index++) {
         char key[5] = {0};
         if (SMCGetKeyFromIndex(smcConn, index, key) != kIOReturnSuccess) {
@@ -469,7 +493,7 @@ static void loadGpuFrequencies(void) {
 }
 
 static double energyToWatts(int64_t energy, CFStringRef unitRef, double durationSeconds) {
-    if (durationSeconds <= 0 || !isCFType(unitRef, CFStringGetTypeID())) {
+    if (energy < 0 || !isfinite(durationSeconds) || durationSeconds <= 0 || !isCFType(unitRef, CFStringGetTypeID())) {
         return 0;
     }
 
@@ -485,117 +509,76 @@ static double energyToWatts(int64_t energy, CFStringRef unitRef, double duration
     return 0;
 }
 
-// Whether AMC Stats produced useful DRAM bandwidth data (probed at init).
-// On M5+ chips, AMC Stats channels exist but the kernel blocks them; we use PMP instead.
-static BOOL gAmcStatsProducesData = NO;
+static int32_t validFanRPM(double value) {
+    return isfinite(value) && value >= 0 && value < 100000 ? (int32_t)value : 0;
+}
 
-+ (void)initialize {
-    if (self != [IOReportWrapper class] || gChannels != NULL) {
-        return;
+static BOOL isUsableSampleWindow(double continuousElapsed, double awakeElapsed) {
+    return isfinite(continuousElapsed) && isfinite(awakeElapsed)
+        && continuousElapsed >= 0.05 && continuousElapsed <= kMaximumSampleGap
+        && fabs(continuousElapsed - awakeElapsed) < 0.25;
+}
+
+// Build without a blocking probe. Both bandwidth groups may be subscribed;
+// each sample prefers AMC when it actually supplies counters, otherwise PMP.
+static BOOL ensureSubscription(void) {
+    if (gSubscription != NULL) return YES;
+    double now = monotonicSeconds();
+    if (now < gNextSubscriptionAttempt || !ioReportFunctionsAvailable()) return NO;
+    clearSubscription();
+    CFDictionaryRef energy = copyIOReportChannels(CFSTR("Energy Model"));
+    if (energy == NULL) energy = copyIOReportChannels(CFSTR("Energy Counters"));
+    if (energy != NULL) {
+        gChannels = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, energy);
+        CFRelease(energy);
     }
-    if (!ioReportFunctionsAvailable()) {
-        return;
+    if (gChannels != NULL) {
+        mergeIOReportGroup(gChannels, CFSTR("Energy Counters"));
+        mergeIOReportGroup(gChannels, CFSTR("GPU Stats"));
+        mergeIOReportGroup(gChannels, CFSTR("CPU Stats"));
+        mergeIOReportGroup(gChannels, CFSTR("AMC Stats"));
+        mergeIOReportGroup(gChannels, CFSTR("PMP"));
+        CFMutableDictionaryRef subsystem = NULL;
+        gSubscription = IOReportCreateSubscription(NULL, gChannels, &subsystem, 0, NULL);
+        if (subsystem != NULL) CFRelease(subsystem);
     }
-
-    CFDictionaryRef energyChannels = copyIOReportChannels(
-        CFSTR("Energy Model")
-    );
-    if (energyChannels == NULL) {
-        energyChannels = copyIOReportChannels(CFSTR("Energy Counters"));
-        if (energyChannels == NULL) {
-            return;
-        }
+    if (gSubscription == NULL) {
+        clearSubscription();
+        gSubscriptionFailures = MIN(gSubscriptionFailures + 1, 5U);
+        gNextSubscriptionAttempt = now + MIN(30.0, (double)(1U << gSubscriptionFailures));
+        return NO;
     }
-
-    gChannels = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, CFDictionaryGetCount(energyChannels), energyChannels);
-    CFRelease(energyChannels);
-
-    if (gChannels == NULL) {
-        return;
-    }
-
-    // macOS 27 starts migrating some power channels to "Energy Counters".
-    // Merge the successor group when available while retaining compatibility
-    // with the classic "Energy Model" channels.
-    mergeIOReportGroup(gChannels, CFSTR("Energy Counters"));
-    mergeIOReportGroup(gChannels, CFSTR("GPU Stats"));
-    mergeIOReportGroup(gChannels, CFSTR("CPU Stats"));
-
-    // Subscribe AMC Stats first to probe if it produces data on this chip.
-    // On M5+ the kernel blocks AMC Stats; we then fall through to PMP.
-    mergeIOReportGroup(gChannels, CFSTR("AMC Stats"));
-
-    CFMutableDictionaryRef subsystem = NULL;
-    gSubscription = IOReportCreateSubscription(NULL, gChannels, &subsystem, 0, NULL);
-    if (subsystem != NULL) { CFRelease(subsystem); }
-
-    // Probe AMC Stats with a 50 ms sample to see if it actually delivers data.
-    // If it does, we trust AMC directly. If not (M5+), merge PMP channels in.
-    if (gSubscription != NULL) {
-        CFDictionaryRef probe1 = IOReportCreateSamples(gSubscription, gChannels, NULL);
-        [NSThread sleepForTimeInterval:0.05];
-        CFDictionaryRef probe2 = IOReportCreateSamples(gSubscription, gChannels, NULL);
-
-        if (isCFType(probe1, CFDictionaryGetTypeID())
-                && isCFType(probe2, CFDictionaryGetTypeID())) {
-            CFDictionaryRef delta = IOReportCreateSamplesDelta(probe1, probe2, NULL);
-            if (delta != NULL) {
-                CFArrayRef channels = ioReportChannelArray(delta);
-                if (channels != NULL) {
-                    CFIndex n = CFArrayGetCount(channels);
-                    for (CFIndex i = 0; i < n && !gAmcStatsProducesData; i++) {
-                        CFTypeRef channelValue = CFArrayGetValueAtIndex(
-                            channels,
-                            i
-                        );
-                        if (!isCFType(channelValue, CFDictionaryGetTypeID())) {
-                            continue;
-                        }
-                        CFDictionaryRef ch = (CFDictionaryRef)channelValue;
-                        CFStringRef grpRef = IOReportChannelGetGroup(ch);
-                        char grp[64] = {0};
-                        if (!copyCFString(grpRef, grp, (CFIndex)sizeof(grp))) {
-                            continue;
-                        }
-                        if (strcmp(grp, "AMC Stats") == 0) {
-                            int64_t v = IOReportSimpleGetIntegerValue(ch, 0);
-                            if (v > 0) { gAmcStatsProducesData = YES; }
-                        }
-                    }
-                }
-                CFRelease(delta);
-            }
-        }
-        if (probe1 != NULL) CFRelease(probe1);
-        if (probe2 != NULL) CFRelease(probe2);
-    }
-
-    // If AMC Stats is blocked (M5+), subscribe to PMP for DRAM bandwidth instead.
-    if (!gAmcStatsProducesData) {
-        CFDictionaryRef pmpChannels = copyIOReportChannels(CFSTR("PMP"));
-        if (pmpChannels != NULL) {
-            IOReportMergeChannels(gChannels, pmpChannels, NULL);
-            CFRelease(pmpChannels);
-            // Re-create subscription with PMP included.
-            // (IOReport subscriptions are not re-subscribable after the fact.)
-            if (gSubscription != NULL) {
-                CFRelease((CFTypeRef)gSubscription);
-                gSubscription = NULL;
-            }
-            CFMutableDictionaryRef sub2 = NULL;
-            gSubscription = IOReportCreateSubscription(
-                NULL,
-                gChannels,
-                &sub2,
-                0,
-                NULL
-            );
-            if (sub2 != NULL) CFRelease(sub2);
-        }
-    }
-
+    gSubscriptionFailures = gSampleFailures = 0;
+    gNextSubscriptionAttempt = 0;
     loadGpuFrequencies();
     loadCpuFrequencies();
+    return YES;
+}
+
+static void recordSampleFailure(void) {
+    clearBaseline();
+    if (++gSampleFailures >= 3) {
+        clearSubscription();
+        gNextSubscriptionAttempt = monotonicSeconds() + 2.0;
+    }
+}
+
++ (void)resetSamplingBaseline {
+    clearBaseline();
+}
+
++ (void)configureTemperatureKeys:(NSArray<NSString *> *)keys {
+    gCpuTempKeyCount = gGpuTempKeyCount = 0;
+    gTemperatureKeysLoaded = YES;
+    for (NSString *name in keys) {
+        const char *key = name.UTF8String;
+        if (strlen(key) != 4 || key[0] != 'T') continue;
+        if ((key[1] == 'p' || key[1] == 'e' || key[1] == 's') && gCpuTempKeyCount < 64) {
+            strcpy(gCpuTempKeys[gCpuTempKeyCount++], key);
+        } else if (key[1] == 'g' && gGpuTempKeyCount < 64) {
+            strcpy(gGpuTempKeys[gGpuTempKeyCount++], key);
+        }
+    }
 }
 
 + (IOReportData)fetchIOReportData {
@@ -604,59 +587,58 @@ static BOOL gAmcStatsProducesData = NO;
 
 + (IOReportData)fetchIOReportDataWithSMC:(io_connect_t)smcConn {
     IOReportData data = {0};
-    if (!ioReportFunctionsAvailable()
-            || gSubscription == NULL
-            || !isCFType(gChannels, CFDictionaryGetTypeID())) {
+    // SMC/HID is independent of IOReport permission, subscription and frames.
+    data.cpuTemp = resolveCPUTemperature(smcConn);
+    data.gpuTemp = resolveGPUTemperature(smcConn);
+    data.cpuDieHotspot = data.cpuTemp;
+    if (smcConn != 0) {
+        double hotspot = SMCGetFloatValue(smcConn, "TCMz");
+        if (isValidTemperature(hotspot)) data.cpuDieHotspot = hotspot;
+        data.fanRPM = validFanRPM(SMCGetFloatValue(smcConn, "F0Ac"));
+        data.fan2RPM = validFanRPM(SMCGetFloatValue(smcConn, "F1Ac"));
+    }
+    data.sampleStatus = MPFSampleUnavailable;
+    if (!ensureSubscription()) return data;
+
+    CFDictionaryRef current = IOReportCreateSamples(gSubscription, gChannels, NULL);
+    const double now = monotonicSeconds();
+    const double awake = NSProcessInfo.processInfo.systemUptime;
+    const double wall = NSDate.date.timeIntervalSince1970;
+    if (!isCFType(current, CFDictionaryGetTypeID())) {
+        if (current != NULL) CFRelease(current);
+        recordSampleFailure();
         return data;
     }
-
-    // A 100 ms window is too short for the Energy Model counters on recent
-    // macOS releases: the GPU channel can occasionally report an empty frame
-    // or turn a very short burst into a misleading one-frame power spike.
-    // Average over 500 ms instead. This remains comfortably below the app's
-    // two-second refresh cadence while matching the stability expected from a
-    // user-facing power meter.
-    const double interval = 0.5;
-
-    CFDictionaryRef sample1 = IOReportCreateSamples(gSubscription, gChannels, NULL);
-    if (!isCFType(sample1, CFDictionaryGetTypeID())) {
-        if (sample1 != NULL) {
-            CFRelease(sample1);
-        }
+    const double sampleSeconds = now - gPreviousTime;
+    const double awakeSeconds = awake - gPreviousAwakeTime;
+    const BOOL hadBaseline = gPreviousSample != NULL;
+    const BOOL usableWindow = hadBaseline
+        && isUsableSampleWindow(sampleSeconds, awakeSeconds);
+    CFDictionaryRef delta = usableWindow
+        ? IOReportCreateSamplesDelta(gPreviousSample, current, NULL) : NULL;
+    const double startWall = gPreviousWallTime;
+    clearBaseline();
+    gPreviousSample = current;
+    gPreviousTime = now;
+    gPreviousAwakeTime = awake;
+    gPreviousWallTime = wall;
+    data.sampleStartTime = usableWindow ? startWall : wall;
+    data.sampleEndTime = wall;
+    if (!usableWindow) {
+        data.sampleStatus = hadBaseline ? MPFSampleReset : MPFSampleBaseline;
         return data;
     }
-    double sample1Time = monotonicSeconds();
-
-    [NSThread sleepForTimeInterval:interval];
-
-    CFDictionaryRef sample2 = IOReportCreateSamples(gSubscription, gChannels, NULL);
-    double sample2Time = monotonicSeconds();
-    if (!isCFType(sample2, CFDictionaryGetTypeID())) {
-        CFRelease(sample1);
-        if (sample2 != NULL) {
-            CFRelease(sample2);
-        }
-        return data;
-    }
-
-    double sampleSeconds = interval;
-    if (sample1Time > 0 && sample2Time > sample1Time) {
-        sampleSeconds = sample2Time - sample1Time;
-    }
-
-    CFDictionaryRef delta = IOReportCreateSamplesDelta(sample1, sample2, NULL);
-    CFRelease(sample1);
-    CFRelease(sample2);
-
-    if (delta == NULL) {
-        return data;
-    }
-
     CFArrayRef channels = ioReportChannelArray(delta);
     if (channels == NULL) {
-        CFRelease(delta);
+        if (delta != NULL) CFRelease(delta);
+        recordSampleFailure();
         return data;
     }
+    gSampleFailures = 0;
+    data.sampleDuration = sampleSeconds;
+    data.sampleStatus = MPFSampleAvailable;
+    data.hasValidEnergySample = YES;
+    BOOL hasInvalidCounter = NO;
 
     // Accumulators for M5+ medium cluster (MCPU0, MCPU1 …)
     double mClusterActiveSum = 0;
@@ -697,7 +679,13 @@ static BOOL gAmcStatsProducesData = NO;
         int64_t value = IOReportSimpleGetIntegerValue(channel, 0);
 
         if (strcmp(grp, "Energy Model") == 0 || strcmp(grp, "Energy Counters") == 0) {
-            double watts = energyToWatts(value, IOReportChannelGetUnitLabel(channel), sampleSeconds);
+            CFStringRef unit = IOReportChannelGetUnitLabel(channel);
+            if (value == INT64_MIN) continue; // IOReport unsupported-accessor sentinel
+            if (value < 0) { hasInvalidCounter = YES; continue; }
+            if (!isCFType(unit, CFStringGetTypeID())
+                || (!CFEqual(unit, CFSTR("mJ")) && !CFEqual(unit, CFSTR("uJ"))
+                    && !CFEqual(unit, CFSTR("nJ")))) continue;
+            double watts = energyToWatts(value, unit, sampleSeconds);
             BOOL isTypedCPU =
                 strstr(chn, "ECPU Energy") != NULL ||
                 strstr(chn, "PCPU Energy") != NULL ||
@@ -706,33 +694,45 @@ static BOOL gAmcStatsProducesData = NO;
                 strstr(chn, "pCPUs Energy") != NULL ||
                 strstr(chn, "mCPUs Energy") != NULL;
             if (isTypedCPU) {
+                data.powerAvailabilityMask |= MPFPowerCPU;
                 cpuTypedEnergyW += watts;
             } else if (strstr(chn, "CPU Energy") != NULL) {
+                data.powerAvailabilityMask |= MPFPowerCPU;
                 cpuTotalEnergyW += watts;
             } else if (strcmp(chn, "GPU Energy") == 0) {
+                data.powerAvailabilityMask |= MPFPowerGPU;
                 data.gpuPower += watts;
             } else if (strncmp(chn, "ANE", 3) == 0) {
+                data.powerAvailabilityMask |= MPFPowerANE;
                 data.anePower += watts;
             } else if (strncmp(chn, "DRAM", 4) == 0) {
+                data.powerAvailabilityMask |= MPFPowerDRAM;
                 data.dramPower += watts;
             } else if (strncmp(chn, "GPU SRAM", 8) == 0) {
+                data.powerAvailabilityMask |= MPFPowerGPUSRAM;
                 data.gpuSRAMPower += watts;
             } else if (strncmp(chn, "ISP", 3) == 0) {
+                data.powerAvailabilityMask |= MPFPowerISP;
                 data.ispPower += watts;
             } else if (strncmp(chn, "DISPEXT", 7) == 0) {
+                data.powerAvailabilityMask |= MPFPowerDisplayExt;
                 data.displayExtPower += watts;
             } else if (strncmp(chn, "DISP", 4) == 0) {
+                data.powerAvailabilityMask |= MPFPowerDisplaySoC;
                 data.displaySoCPower += watts;
             } else if (strncmp(chn, "AVE", 3) == 0
                     || strncmp(chn, "MSR", 3) == 0) {
+                data.powerAvailabilityMask |= MPFPowerMedia;
                 data.mediaPower += watts;
             } else if (strncmp(chn, "PCIe Port", 9) == 0
                     || strncmp(chn, "apciec", 6) == 0) {
+                data.powerAvailabilityMask |= MPFPowerPCIe;
                 data.pciePower += watts;
             } else if (strncmp(chn, "AMCC", 4) == 0
                     || strncmp(chn, "DCS", 3) == 0
                     || strncmp(chn, "FAB", 3) == 0
                     || strncmp(chn, "AFR", 3) == 0) {
+                data.powerAvailabilityMask |= MPFPowerFabric;
                 data.fabricPower += watts;
             }
             // Note: systemPower comes from SMC "PSTR" key, not from IOReport.
@@ -756,6 +756,8 @@ static BOOL gAmcStatsProducesData = NO;
 
                 for (int32_t s = 0; s < stateCount; s++) {
                     int64_t residency = IOReportStateGetResidency(channel, s);
+                    if (residency == INT64_MIN) continue;
+                    if (residency < 0) { hasInvalidCounter = YES; continue; }
                     totalTime += residency;
 
                     CFStringRef snRef = IOReportStateGetNameForIndex(channel, s);
@@ -810,6 +812,8 @@ static BOOL gAmcStatsProducesData = NO;
 
             for (int32_t s = 0; s < stateCount; s++) {
                 int64_t residency = IOReportStateGetResidency(channel, s);
+                if (residency == INT64_MIN) continue;
+                if (residency < 0) { hasInvalidCounter = YES; continue; }
                 totalTime += residency;
 
                 CFStringRef snRef = IOReportStateGetNameForIndex(channel, s);
@@ -866,6 +870,8 @@ static BOOL gAmcStatsProducesData = NO;
         } else if (strcmp(grp, "AMC Stats") == 0) {
             // Skip DCS channels — they are a subset of the total; counting them
             // would double-count bandwidth already captured by other channels.
+            if (value == INT64_MIN) continue;
+            if (value < 0) { hasInvalidCounter = YES; continue; }
             if (strstr(chn, "DCS") != NULL) continue;
             if (strstr(chn, "RD") != NULL)  { data.dramReadBytes  += value; }
             else if (strstr(chn, "WR") != NULL) { data.dramWriteBytes += value; }
@@ -877,7 +883,9 @@ static BOOL gAmcStatsProducesData = NO;
             if (!copyCFString(subgroupRef, sub, (CFIndex)sizeof(sub))) {
                 continue;
             }
-            if (strcmp(sub, "DRAM BW") == 0 && value > 0) {
+            if (strcmp(sub, "DRAM BW") != 0 || value == INT64_MIN) continue;
+            if (value < 0) { hasInvalidCounter = YES; continue; }
+            if (value > 0) {
                 if (strstr(chn, "RD") != NULL)       { pmpDramReadBytes  += value; }
                 else if (strstr(chn, "WR") != NULL)  { pmpDramWriteBytes += value; }
             }
@@ -913,25 +921,19 @@ static BOOL gAmcStatsProducesData = NO;
         data.dramWriteBytes = (int64_t)((double)data.dramWriteBytes / sampleSeconds);
     }
 
-    data.cpuTemp = resolveCPUTemperature(smcConn);
-    data.gpuTemp = resolveGPUTemperature(smcConn);
-
-    // CPU die hotspot — TCMz is the fastest-reacting Apple Silicon thermal sensor.
-    // It reflects the actual hottest point on the CPU die regardless of which cores are active.
-    // Falls back to cpuTemp if SMC key is unavailable (non-Apple-Silicon or permissions issue).
-    if (smcConn != 0) {
-        double hotspot = SMCGetFloatValue(smcConn, "TCMz");
-        data.cpuDieHotspot = (hotspot > 10.0 && hotspot < 150.0) ? hotspot : data.cpuTemp;
-
-        // Fan speed — F0Ac = Fan 0 Actual RPM.
-        // Returns 0 on fanless models (e.g. MacBook Air). Check F1Ac for a second fan
-        // if the hardware has dual fans (Mac Pro / Mac Studio / MacBook Pro 16").
-        double fan0 = SMCGetFloatValue(smcConn, "F0Ac");
-        data.fanRPM = (fan0 > 0) ? (int32_t)fan0 : 0;
-        double fan1 = SMCGetFloatValue(smcConn, "F1Ac");
-        data.fan2RPM = (fan1 > 0) ? (int32_t)fan1 : 0;
+    if (hasInvalidCounter) {
+        // A reset/wrapped counter must not turn into negative or huge watts.
+        // Retain this frame only as the next baseline; suppress all energy.
+        data.powerAvailabilityMask = 0;
+        data.hasValidEnergySample = NO;
+        data.sampleStatus = MPFSampleReset;
+        data.cpuPower = data.gpuPower = data.anePower = data.dramPower = 0;
+        data.gpuSRAMPower = data.mediaPower = data.ispPower = data.fabricPower = 0;
+        data.pciePower = data.displaySoCPower = data.displayExtPower = 0;
+        data.dramReadBytes = data.dramWriteBytes = 0;
     }
 
+    data.hasValidEnergySample = data.hasValidEnergySample && data.powerAvailabilityMask != 0;
     CFRelease(delta);
     return data;
 }

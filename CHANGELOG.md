@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.6.0 — 2026-09-22
+
+- Correct signed battery flow, including AC plus battery supply; preserve genuine idle zero and avoid classifying asynchronous SMC residuals as charging.
+- Use continuous IOReport energy deltas with per-domain availability and reset/recovery handling.
+- Keep raw readings, source windows and history separate from visual budget adjustments; replace invented component allocations with an unattributed residual.
+- Add charging diagnostics, memory pressure/Swap, native CPU/GPU process activity, network/disk rates and active sleep assertions.
+- Add bounded local history, task energy estimates, CSV/JSON exports, and opt-in sustained-condition notifications.
+- Add adaptive sampling, sleep recovery, enhanced-stream stall recovery, and macOS27 MetricKit/StateReporting self-diagnostics.
+- Include Stats and macmon reference licenses with the existing MIT notices.
+
+
+## 1.5.4 — 2026-09-21 (local build)
+
+- Automatic startup now connects silently. Installation/update authorization is available only through the explicit context-menu action.
+- Allow up to 16 connection attempts for a matching helper during cold login. Exhausted connection retries no longer trigger reinstallation.
+- Check the installed client identity as well as the helper binary, so an app-only update is detected before XPC retries.
+- Invalidate queued reconnects across stop/restart and ignore duplicate enhanced-start requests without corrupting model state.
+- Add production-runner regression tests and a read-only `--diagnose-startup` snapshot.
+
+
 ## 1.5.3 — 2026-08-07
 
 - Fixed charging power being understated because AppleSMC `PPBR` was

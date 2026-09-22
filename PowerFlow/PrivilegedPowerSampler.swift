@@ -28,6 +28,7 @@ nonisolated enum PrivilegedThermalPressure: String, Sendable, Equatable {
 
 nonisolated struct PrivilegedPowerSample: Sendable, Equatable {
     let timestamp: Date
+    let windowStart: Date?
     let cpuPowerWatts: Double?
     let gpuPowerWatts: Double?
     let anePowerWatts: Double?
@@ -87,6 +88,7 @@ final class PrivilegedPowerSampler {
     /// error string if authorization/launch fails.
     @discardableResult
     func start(
+        allowInstallation: Bool = false,
         onSample: @escaping SampleHandler,
         onStateChange: @escaping StateHandler,
         completion: @escaping StartCompletion
@@ -101,7 +103,7 @@ final class PrivilegedPowerSampler {
         sampleHandler = onSample
         stateHandler = onStateChange
         startCompletion = completion
-        launchStream()
+        launchStream(allowInstallation: allowInstallation)
         return true
     }
 
@@ -129,10 +131,11 @@ final class PrivilegedPowerSampler {
         setState(.stopping)
     }
 
-    private func launchStream() {
+    private func launchStream(allowInstallation: Bool) {
         guard wantsSampling else { return }
 
-        runner.start(
+        runner.startAllowingInstallation(
+            allowInstallation,
             dataHandler: { [weak self] data in
                 self?.consume(data)
             },
@@ -307,8 +310,15 @@ final class PrivilegedPowerSampler {
             return nil
         }
 
+        let timestamp = root["timestamp"] as? Date ?? Date()
+        let elapsed = (root["elapsed_ns"] as? NSNumber)?.doubleValue
+        let windowStart = elapsed.flatMap { nanoseconds -> Date? in
+            guard nanoseconds.isFinite, nanoseconds > 0, nanoseconds < 60_000_000_000 else { return nil }
+            return timestamp.addingTimeInterval(-nanoseconds / 1_000_000_000)
+        }
         return PrivilegedPowerSample(
-            timestamp: root["timestamp"] as? Date ?? Date(),
+            timestamp: timestamp,
+            windowStart: windowStart,
             cpuPowerWatts: cpuPower,
             gpuPowerWatts: gpuPower,
             anePowerWatts: anePower,

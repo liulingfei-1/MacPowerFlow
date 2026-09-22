@@ -7,7 +7,7 @@ project_dir="$(cd -- "${script_dir}/.." && pwd -P)"
 project_file="${project_dir}/MacPowerFlow.xcodeproj"
 scheme="MacPowerFlow"
 product_name="MacPowerFlow.app"
-archive_name="MacPowerFlow-1.5.3.zip"
+archive_name="MacPowerFlow-1.6.0.zip"
 dist_dir="${project_dir}/dist"
 backup_dir="${project_dir}/.build/previous-releases"
 output_archive="${dist_dir}/${archive_name}"
@@ -63,7 +63,7 @@ source_items=(MacPowerFlow.xcodeproj PowerFlow Shared Helper Installer)
 git -C "${project_dir}" archive --format=tar HEAD -- "${source_items[@]}" \
     | tar -xf - -C "${source_root}"
 git -C "${project_dir}" diff --binary HEAD -- "${source_items[@]}" \
-    | git -C "${source_root}" apply --binary --whitespace=nowarn
+    | git -C "${source_root}" apply --allow-empty --binary --whitespace=nowarn
 
 # Include any intentional, non-ignored new source file in the working tree.
 while IFS= read -r -d '' untracked_source; do

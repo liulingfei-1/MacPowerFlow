@@ -15,6 +15,8 @@ enum AboutCredits {
     )!
 
     private static let projects = [
+        Project(name: "macmon", url: URL(string: "https://github.com/vladkens/macmon")!),
+        Project(name: "Stats", url: URL(string: "https://github.com/exelban/stats")!),
         Project(
             name: "macpow",
             url: URL(string: "https://github.com/k06a/macpow")!

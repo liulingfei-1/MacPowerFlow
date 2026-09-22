@@ -18,10 +18,15 @@ struct EnergyFlowView: View {
                 VStack(spacing: 12) {
                     statusStrip
                     batteryRail
-                    powerFlow
+                    if model.systemLoadAvailable {
+                        powerFlow
+                    } else {
+                        Text("等待可靠的整机功耗数据").foregroundStyle(.secondary).frame(height: 100)
+                    }
                     componentDetailCard
                     hardwareCard
                     processCard
+                    InsightsView(model: model)
                     footer
                 }
                 .padding(.horizontal, 14)
@@ -156,7 +161,10 @@ struct EnergyFlowView: View {
             cpuPower: model.effectiveCPUPowerWatts,
             gpuPower: model.effectiveGPUPowerWatts,
             displayPower: model.effectiveDisplayPowerWatts,
-            unclassifiedPower: model.effectiveOtherPowerWatts
+            unclassifiedPower: model.effectiveOtherPowerWatts,
+            cpuAvailable: model.rawCPUWatts != nil,
+            gpuAvailable: model.rawGPUWatts != nil,
+            displayAvailable: ["PBwo", "PDBR"].contains { model.smcReadings[$0]?.status == .available }
         )
         .frame(height: 228)
     }
@@ -312,7 +320,7 @@ struct EnergyFlowView: View {
                     : nil
             )
             metricRow(
-                "Mac 实时输入",
+                "遥测输入电压 / 电流",
                 symbol: "bolt.horizontal.fill",
                 value: electrical(
                     voltage: model.systemInputVoltage,
@@ -321,9 +329,10 @@ struct EnergyFlowView: View {
                 detail: adapterContractText
             )
             metricRow(
-                "转换损耗 / 对外供电",
+                "遥测损耗 / 外设分配额度",
                 symbol: "arrow.left.arrow.right",
-                value: "\(watts(model.adapterEfficiencyLossWatts, allowZero: true))  /  \(watts(model.externalPowerOutWatts, allowZero: true))"
+                value: "\(watts(model.adapterEfficiencyLossWatts, allowZero: true))  /  \(watts(model.externalPowerOutWatts, allowZero: true))",
+                detail: "额度并非实测外设消耗"
             )
             metricRow(
                 "整机负载",
@@ -642,6 +651,7 @@ struct EnergyFlowView: View {
         guard model.batteryPresent else { return "无电池" }
         if model.isCharging { return "充电中" }
         if model.isFullyCharged { return "已充满" }
+        if model.isSupplementingAdapter { return "电池补电" }
         if model.batteryFlowDirection == .supplying { return "放电中" }
         return model.isOnAC ? "未充电" : "电池供电"
     }
@@ -795,20 +805,7 @@ struct EnergyFlowView: View {
     }
 
     private var otherModelNote: String {
-        let readRate = max(0, model.dramReadBytesPerSecond)
-        let writeRate = max(0, model.dramWriteBytesPerSecond)
-        let memoryRate = readRate > Int64.max - writeRate
-            ? Int64.max
-            : readRate + writeRate
-        var signals = ["整机负载", "芯片活跃度"]
-        if memoryRate > 0 {
-            signals.append("内存带宽 \(bandwidth(memoryRate))")
-        }
-        if model.fanRPM > 0 || model.fan2RPM > 0 {
-            signals.append("风扇 \(fanSummary)")
-        }
-        return "跟随" + signals.joined(separator: "、")
-            + "同步更新，每次采样都会重新分配。"
+        "独立通道保留原始值与有效零值；其余归为未归因，不再按固定权重分配网络、风扇或控制器瓦数。"
     }
 
     private var lastUpdatedText: String {
@@ -978,6 +975,9 @@ private struct SculptedPowerFlow: View {
     let gpuPower: Double
     let displayPower: Double
     let unclassifiedPower: Double
+    let cpuAvailable: Bool
+    let gpuAvailable: Bool
+    let displayAvailable: Bool
 
     private let fill = Color(red: 0.19, green: 0.20, blue: 0.22)
     private let strongFill = Color(red: 0.22, green: 0.23, blue: 0.25)
@@ -1478,7 +1478,7 @@ private struct SculptedPowerFlow: View {
                     .foregroundStyle(quiet)
                     .lineLimit(1)
 
-                Text(compactWatt(branch.power))
+                Text(branchAvailable(branch.id) ? compactWatt(branch.power, allowZero: true) : "—")
                     .font(.system(size: 11.5, weight: .bold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(text)
@@ -1537,6 +1537,10 @@ private struct SculptedPowerFlow: View {
             "显示 \(watt(displayPower))",
             "其他 \(watt(unclassifiedPower))"
         ].joined(separator: "；")
+    }
+
+    private func branchAvailable(_ id: Int) -> Bool {
+        switch id { case 0: cpuAvailable; case 1: gpuAvailable; case 2: displayAvailable; default: true }
     }
 
     private func safePower(_ value: Double) -> Double {

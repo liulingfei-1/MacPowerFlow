@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Darwin
 import Foundation
@@ -44,6 +45,77 @@ nonisolated enum AdministratorSamplingState: Sendable, Equatable {
 /// UI thread. This object only publishes completed Sendable snapshots.
 @MainActor
 final class PowerMonitor: ObservableObject {
+    let history = PowerHistoryStore()
+    let diagnostics = AppDiagnostics()
+    let alerts = PowerAlerts()
+    @Published private(set) var insights: SystemInsightsSnapshot?
+    @Published private(set) var latestBattery: BatterySnapshot?
+    @Published private(set) var powerAvailability: Set<String> = []
+    @Published private(set) var systemLoadAvailable = false
+    @Published private(set) var systemHistoryQuality = PowerHistoryQuality.unavailable
+    @Published private(set) var powerSourceLabel = "等待采样"
+    @Published private(set) var samplingStatus = "baseline"
+    @Published private(set) var sampleDuration: TimeInterval = 0
+    @Published private(set) var powerBalanceResidual: Double?
+    @Published private(set) var signedBatteryWatts: Double?
+    @Published private(set) var panelVisible = false
+    private let insightsSampler = SystemInsightsSampler()
+    private var lifecycleObservers: [NSObjectProtocol] = []
+    private var suspended = false
+    private var nextEnhancedRetry = Date.distantPast
+    private var enhancedRetryCount = 0
+    private var automaticEnhancedSampling = true
+
+    var rawCPUWatts: Double? {
+        if administratorSampleIsFresh && administratorCPUHasValue { return administratorCPUPowerWatts }
+        return powerAvailability.contains("cpu") ? cpuPowerWatts : nil
+    }
+    var rawGPUWatts: Double? {
+        if administratorSampleIsFresh && administratorGPUHasValue { return administratorGPUPowerWatts }
+        return powerAvailability.contains("gpu") ? gpuPowerWatts : nil
+    }
+    var isSupplementingAdapter: Bool { isOnAC && adapterInputWatts > 0.2 && (signedBatteryWatts ?? 0) < -0.2 }
+    var flowWasAdjusted: Bool {
+        abs((rawCPUWatts ?? 0) - effectiveCPUPowerWatts) > 0.1 ||
+        abs((rawGPUWatts ?? 0) - effectiveGPUPowerWatts) > 0.1 ||
+        displayPowerWatts - effectiveDisplayPowerWatts > 0.1
+    }
+    var samplingIntervalSeconds: Double {
+        if panelVisible || history.activeSession != nil { return 2 }
+        return lowPowerModeEnabled ? 10 : 5
+    }
+    func setPanelVisible(_ value: Bool) {
+        panelVisible = value
+        diagnostics.updateState(panelVisible: value, enhancedSampling: administratorSampleIsFresh)
+        if value { refreshNow() }
+    }
+    private func installLifecycleObservers() {
+        guard lifecycleObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        lifecycleObservers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.suspended = true
+                self.history.breakContinuity()
+                self.history.flush()
+                self.privilegedPowerSampler.stop()
+            }
+        })
+        lifecycleObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.hardwareSampler.resetBaseline()
+                await self.insightsSampler.reset()
+                self.history.breakContinuity()
+                self.suspended = false
+                self.enhancedRetryCount = 0
+                self.nextEnhancedRetry = .distantPast
+                self.lastProcessRefresh = .distantPast
+                self.refreshNow()
+            }
+        })
+    }
+
     // MARK: - Identity and sampling state
 
     @Published private(set) var chipName: String
@@ -153,6 +225,7 @@ final class PowerMonitor: ObservableObject {
     @Published private(set) var administratorErrorMessage = ""
     @Published private(set) var administratorLastUpdated = Date.distantPast
     @Published private(set) var administratorSampleCount = 0
+    private var administratorWindowStart: Date?
     @Published private(set) var administratorCPUPowerWatts = 0.0
     @Published private(set) var administratorCPUHasValue = false
     @Published private(set) var administratorGPUPowerWatts = 0.0
@@ -168,9 +241,7 @@ final class PowerMonitor: ObservableObject {
     @Published private(set) var administratorThermalPressure =
         PrivilegedThermalPressure.unknown
 
-    private let sampleIntervalNanoseconds: UInt64 = 2_000_000_000
     private let processInterval: TimeInterval = 10
-    private let chargingBalanceFreshness: TimeInterval = 6
     private let hardwareSampler = HardwareSampler()
     private let privilegedPowerSampler = PrivilegedPowerSampler()
 
@@ -179,21 +250,9 @@ final class PowerMonitor: ObservableObject {
     private var processTask: Task<Void, Never>?
     private var lastProcessRefresh = Date.distantPast
     private var previousCPUTicks: [[UInt32]] = []
-    private var lastChargingPowerBalance: ChargingPowerBalance?
-    private var lastChargingPowerBalanceDate = Date.distantPast
     private var administratorStartupWatchdogTask: Task<Void, Never>?
     private var powerSourceRunLoopSource: CFRunLoopSource?
     private var administratorTerminalError: String?
-    private var lastReasonableStandardGPUPowerWatts: Double?
-    private var lastReasonableStandardGPUSampleDate = Date.distantPast
-
-    /// SMC, IOReport and powermetrics do not close their sampling windows at
-    /// exactly the same instant. Accept a small one-frame overshoot, then clamp
-    /// it to the physical budget; a larger overshoot is treated as an invalid
-    /// sample rather than being allowed to consume the CPU/other branches.
-    private let componentBudgetAbsoluteToleranceWatts = 1.0
-    private let componentBudgetRelativeTolerance = 0.10
-    private let standardGPUFallbackFreshness: TimeInterval = 8
 
     init() {
         chipName = Self.sysctlString("machdep.cpu.brand_string")
@@ -221,18 +280,22 @@ final class PowerMonitor: ObservableObject {
     ) {
         guard monitoringTask == nil else { return }
 
+        automaticEnhancedSampling = automaticallyStartAdministrator
         isSampling = true
+        suspended = false
+        installLifecycleObservers()
+        history.breakContinuity()
+        diagnostics.start()
         installPowerSourceWatcherIfNeeded()
         refreshNow()
         if automaticallyStartAdministrator {
             startAdministratorSampling()
         }
 
-        let interval = sampleIntervalNanoseconds
         monitoringTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(nanoseconds: interval)
+                    try await Task.sleep(nanoseconds: UInt64((self?.samplingIntervalSeconds ?? 5) * 1_000_000_000))
                 } catch {
                     break
                 }
@@ -255,6 +318,11 @@ final class PowerMonitor: ObservableObject {
         administratorStartupWatchdogTask?.cancel()
         administratorStartupWatchdogTask = nil
         removePowerSourceWatcher()
+        lifecycleObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        lifecycleObservers.removeAll()
+        history.breakContinuity()
+        history.flush()
+        diagnostics.stop()
         privilegedPowerSampler.stop()
 
         let sampler = hardwareSampler
@@ -262,8 +330,6 @@ final class PowerMonitor: ObservableObject {
             await sampler.close()
         }
         previousCPUTicks.removeAll(keepingCapacity: true)
-        lastReasonableStandardGPUPowerWatts = nil
-        lastReasonableStandardGPUSampleDate = .distantPast
         isSampling = false
     }
 
@@ -271,6 +337,7 @@ final class PowerMonitor: ObservableObject {
     /// fixture in the model exercises the same main-panel state as a live read,
     /// rather than tinting only the menu-bar icon.
     func installChargingPreview() {
+        systemLoadAvailable = true
         batteryPresent = true
         batteryLevel = 62
         isCharging = true
@@ -364,68 +431,13 @@ final class PowerMonitor: ObservableObject {
     }
 
     private var effectiveProcessorPowerAllocation: ProcessorPowerAllocation {
-        let budget = availableProcessorPowerBudgetWatts
-        guard budget > 0.02 else {
-            return ProcessorPowerAllocation(cpuWatts: 0, gpuWatts: 0)
-        }
-
-        let gpuCandidate = effectiveGPUPowerCandidate(budget: budget)
-        let administratorCPU = administratorSampleIsFresh
-            && administratorCPUHasValue
-            ? administratorCPUPowerWatts
-            : nil
-        let combinedResidual = administratorCPUResidualPowerWatts(
-            gpuCandidateWatts: gpuCandidate
+        // Only the flow's widths/labels are reconciled. Raw readings and history
+        // retain their original values and the detail panel exposes this choice.
+        PowerMetricsCore.allocateProcessorPower(
+            cpuCandidateWatts: rawCPUWatts ?? 0,
+            gpuCandidateWatts: rawGPUWatts ?? 0,
+            budgetWatts: availableProcessorPowerBudgetWatts
         )
-        let cpuEstimate = estimatedCPUPowerWatts(
-            processorBudgetWatts: budget,
-            reconciledGPUWatts: gpuCandidate
-        )
-        let cpuCandidate = PowerMetricsCore.firstMeaningfulPowerWatts([
-            administratorCPU,
-            combinedResidual,
-            cpuPowerWatts,
-            cpuEstimate,
-        ])
-
-        return PowerMetricsCore.allocateProcessorPower(
-            cpuCandidateWatts: cpuCandidate,
-            gpuCandidateWatts: gpuCandidate,
-            budgetWatts: budget
-        )
-    }
-
-    private func effectiveGPUPowerCandidate(budget: Double) -> Double {
-        let standard = min(nonnegativePower(gpuPowerWatts), budget)
-        guard administratorSampleIsFresh,
-              administratorGPUHasValue,
-              administratorGPUPowerWatts > 0.02 else {
-            return standard
-        }
-
-        let administrator = nonnegativePower(administratorGPUPowerWatts)
-        guard !isClearlyAbovePowerBudget(administrator, budget: budget) else {
-            return standard
-        }
-        return min(administrator, budget)
-    }
-
-    private func administratorCPUResidualPowerWatts(
-        gpuCandidateWatts: Double
-    ) -> Double? {
-        guard administratorSampleIsFresh,
-              administratorCombinedHasValue,
-              administratorCombinedPowerWatts > 0.02 else {
-            return nil
-        }
-
-        let administratorANE = administratorANEHasValue
-            ? administratorANEPowerWatts
-            : anePowerWatts
-        let residual = administratorCombinedPowerWatts
-            - nonnegativePower(gpuCandidateWatts)
-            - nonnegativePower(administratorANE)
-        return residual > 0.02 ? residual : nil
     }
 
     var effectiveANEPowerWatts: Double {
@@ -502,7 +514,12 @@ final class PowerMonitor: ObservableObject {
                 basis: "SMC USB 功耗轨"
             )
         ]
-        .filter { $0.powerWatts > 0.02 && $0.powerWatts.isFinite }
+        .filter { component in
+            if component.id == "ane", administratorSampleIsFresh && administratorANEHasValue { return true }
+            if component.id == "wifi" { return smcReadings["wiPm"]?.status == .available }
+            if component.id == "usb" { return ["PUSB", "PUS0", "PUS1", "PUS2"].contains { smcReadings[$0]?.status == .available } }
+            return powerAvailability.contains(component.id) && component.powerWatts.isFinite
+        }
     }
 
     /// Power left after subtracting directly readable secondary channels from
@@ -516,185 +533,11 @@ final class PowerMonitor: ObservableObject {
         return max(0, effectiveOtherPowerWatts - directTotal)
     }
 
-    /// Honest, activity-shaped allocation of the part of "other" for which no
-    /// independent watt channel exists. These are not invented sensors;
-    /// provenance remains in `basis` for diagnostics while the UI stays compact.
-    ///
-    /// Four non-overlapping system buckets are always present. Up to two more
-    /// are added only when their corresponding direct channels are absent, so
-    /// the expanded card stays within 4...6 compact items.
+    /// Residual only; no fixed-weight attribution to unmeasured devices.
     var estimatedOtherPowerComponents: [OtherPowerComponent] {
-        let directIDs = Set(readableOtherPowerComponents.map(\.id))
-        let budget = estimatedOtherPowerBudgetWatts
-
-        // Saturating normalizations avoid model-specific TDP/RPM constants
-        // while still reacting smoothly to every two-second hardware sample.
-        let loadSignal = saturatingSignal(systemLoadWatts, halfScale: 18)
-        let memoryRate = Double(max(0, dramReadBytesPerSecond))
-            + Double(max(0, dramWriteBytesPerSecond))
-        let memorySignal = saturatingSignal(
-            memoryRate,
-            halfScale: 8_000_000_000
-        )
-        let cpuSignal = min(max(cpuUsagePercent / 100, 0), 1)
-        let reportedGPUActivity = administratorSampleIsFresh
-            && administratorGPUActivePercent >= 0
-            ? administratorGPUActivePercent
-            : gpuUsagePercent
-        let gpuSignal = reportedGPUActivity >= 0
-            ? min(max(reportedGPUActivity / 100, 0), 1)
-            : 0
-        let activitySignal = max(cpuSignal, gpuSignal)
-        let activeFanCount = [fanRPM, fan2RPM].filter { $0 > 0 }
-        let averageFanRPM = activeFanCount.isEmpty
-            ? 0
-            : Double(activeFanCount.reduce(0, +))
-                / Double(activeFanCount.count)
-        let fanSignal = saturatingSignal(averageFanRPM, halfScale: 2_500)
-
-        var seeds: [(id: String, label: String, basis: String, weight: Double)] = []
-
-        let memoryMissing = !directIDs.contains("dram")
-        let fabricMissing = !directIDs.contains("fabric")
-        if memoryMissing || fabricMissing {
-            let label: String
-            switch (memoryMissing, fabricMissing) {
-            case (true, true):
-                label = "内存与芯片互联"
-            case (true, false):
-                label = "内存活动"
-            case (false, true):
-                label = "芯片互联"
-            case (false, false):
-                label = ""
-            }
-            seeds.append((
-                id: "estimated-memory-fabric",
-                label: label,
-                basis: memoryMissing ? "内存带宽 + 整机活动" : "整机活动",
-                weight: 0.45 + 2.6 * memorySignal + 0.65 * loadSignal
-            ))
-        }
-
-        let mediaMissing = !directIDs.contains("media")
-        let ispMissing = !directIDs.contains("isp")
-        let pcieMissing = !directIDs.contains("pcie")
-        if mediaMissing || ispMissing || pcieMissing {
-            let engineMissing = mediaMissing || ispMissing
-            let label: String
-            switch (engineMissing, pcieMissing) {
-            case (true, true):
-                label = "媒体、存储与外设"
-            case (true, false):
-                label = mediaMissing && ispMissing
-                    ? "媒体与图像处理"
-                    : (mediaMissing ? "媒体引擎" : "图像处理")
-            case (false, true):
-                label = "存储与高速外设"
-            case (false, false):
-                label = ""
-            }
-            seeds.append((
-                id: "estimated-media-peripherals",
-                label: label,
-                basis: "芯片活跃 + 整机活动",
-                weight: 0.55 + 1.5 * activitySignal + 0.8 * loadSignal
-            ))
-        }
-
-        // macOS does not expose portable watt channels for these four groups.
-        // They never duplicate the CPU/GPU/display or the direct domains above.
-        if !directIDs.contains("wifi") {
-            seeds.append((
-                id: "estimated-network",
-                label: "网络与无线",
-                basis: "整机活动代理",
-                weight: 0.65 + 0.45 * loadSignal
-            ))
-        }
-
-        seeds.append(contentsOf: [
-            (
-                id: "estimated-cooling",
-                label: "风扇与散热",
-                basis: averageFanRPM > 0 ? "风扇转速" : "散热基线",
-                weight: 0.22 + 2.0 * fanSignal
-            ),
-            (
-                id: "estimated-board-conversion",
-                label: "板级电源转换",
-                basis: "整机负载",
-                weight: 0.85 + 1.45 * loadSignal
-            ),
-            (
-                id: "estimated-controllers",
-                label: "主板控制器与传感器",
-                basis: "基础常驻负载",
-                weight: 1.0 + 0.2 * (1 - loadSignal)
-            )
-        ])
-
-        let totalWeight = seeds.reduce(0) { $0 + max(0, $1.weight) }
-        guard totalWeight > 0 else { return [] }
-
-        var allocated = 0.0
-        return seeds.enumerated().map { index, seed in
-            let power: Double
-            if index == seeds.index(before: seeds.endIndex) {
-                // Assign the final floating-point remainder to the last row so
-                // the estimate sum is exactly the bounded budget.
-                power = max(0, budget - allocated)
-            } else {
-                power = budget * max(0, seed.weight) / totalWeight
-                allocated += power
-            }
-            return OtherPowerComponent(
-                id: seed.id,
-                label: seed.label,
-                powerWatts: power,
-                basis: seed.basis
-            )
-        }
-    }
-
-    var estimatedOtherPowerTotalWatts: Double {
-        estimatedOtherPowerComponents.reduce(0) { $0 + $1.powerWatts }
-    }
-
-    private func saturatingSignal(
-        _ value: Double,
-        halfScale: Double
-    ) -> Double {
-        guard value.isFinite, value > 0, halfScale > 0 else { return 0 }
-        return min(max(value / (value + halfScale), 0), 1)
-    }
-
-    /// Best-effort CPU estimate used while the persistent privileged stream is
-    /// connecting, unavailable, or missing a CPU field on this Mac model.
-    ///
-    /// Prefer a residual from the SoC estimate when one exists. Otherwise
-    /// allocate a conservative, utilization-shaped share of whole-system load.
-    /// Provenance stays internal so the compact UI does not need a prefix.
-    private func estimatedCPUPowerWatts(
-        processorBudgetWatts: Double,
-        reconciledGPUWatts: Double
-    ) -> Double {
-        let availableSystemPower = nonnegativePower(processorBudgetWatts)
-        guard availableSystemPower > 0.02 else { return 0 }
-
-        let knownSoCPower =
-            nonnegativePower(reconciledGPUWatts)
-                + anePowerWatts
-                + dramPowerWatts
-        let socResidual = processorPowerWatts - knownSoCPower
-        if socResidual > 0.02 {
-            return min(availableSystemPower, socResidual)
-        }
-
-        let utilization = min(max(cpuUsagePercent / 100, 0), 1)
-        let cpuShare = 0.06 + 0.44 * sqrt(utilization)
-        let usageEstimate = max(0.6, systemLoadWatts * cpuShare)
-        return min(availableSystemPower, usageEstimate)
+        [OtherPowerComponent(id: "unattributed", label: "未归因功耗",
+                             powerWatts: estimatedOtherPowerBudgetWatts,
+                             basis: "整机残差，不能独立分配到网络、风扇等设备")]
     }
 
     var effectiveGPUFrequencyMHz: Int {
@@ -720,7 +563,10 @@ final class PowerMonitor: ObservableObject {
         }
     }
 
-    private func startAdministratorSampling() {
+    func startAdministratorSampling(allowInstallation: Bool = false) {
+        if allowInstallation { enhancedRetryCount = 0; nextEnhancedRetry = Date().addingTimeInterval(60) }
+        guard !privilegedPowerSampler.isRunning,
+              privilegedPowerSampler.state != .stopping else { return }
         administratorStartupWatchdogTask?.cancel()
         administratorStartupWatchdogTask = nil
         administratorTerminalError = nil
@@ -733,6 +579,7 @@ final class PowerMonitor: ObservableObject {
         administratorSamplingState = .authorizing
 
         let started = privilegedPowerSampler.start(
+            allowInstallation: allowInstallation,
             onSample: { [weak self] sample in
                 self?.applyAdministratorSample(sample)
             },
@@ -786,6 +633,8 @@ final class PowerMonitor: ObservableObject {
         } ?? -1
         administratorThermalPressure = sample.thermalPressure
         administratorLastUpdated = sample.timestamp
+        administratorWindowStart = sample.windowStart
+        enhancedRetryCount = 0
         administratorSampleCount += 1
         administratorStartupWatchdogTask?.cancel()
         administratorStartupWatchdogTask = nil
@@ -863,7 +712,7 @@ final class PowerMonitor: ObservableObject {
     }
 
     func refreshNow() {
-        guard refreshTask == nil else { return }
+        guard isSampling, !suspended, refreshTask == nil else { return }
         let sampler = hardwareSampler
         refreshTask = Task { @MainActor [weak self] in
             let snapshot = await sampler.sample()
@@ -892,6 +741,41 @@ final class PowerMonitor: ObservableObject {
         scheduleProcessRefreshIfNeeded()
 
         lastUpdated = Date()
+        if snapshot.processor.sampleStatus == "reset" || snapshot.processor.sampleStatus == "baseline" {
+            history.breakContinuity()
+        }
+        history.record(PowerHistoryPoint(
+            timestamp: lastUpdated, windowStart: lastUpdated, windowEnd: lastUpdated,
+            systemWatts: systemLoadAvailable ? systemLoadWatts : nil,
+            cpuWatts: rawCPUWatts, gpuWatts: rawGPUWatts,
+            signedBatteryWatts: signedBatteryWatts,
+            source: powerSourceLabel,
+            quality: systemHistoryQuality,
+            cpuWindowStart: administratorSampleIsFresh && administratorCPUHasValue ? administratorWindowStart : (snapshot.processor.powerAvailability.contains("cpu") ? Date(timeIntervalSince1970: snapshot.processor.samplingWindowStart) : nil),
+            cpuWindowEnd: administratorSampleIsFresh && administratorCPUHasValue ? administratorLastUpdated : (snapshot.processor.powerAvailability.contains("cpu") ? Date(timeIntervalSince1970: snapshot.processor.samplingWindowEnd) : nil),
+            gpuWindowStart: administratorSampleIsFresh && administratorGPUHasValue ? administratorWindowStart : (snapshot.processor.powerAvailability.contains("gpu") ? Date(timeIntervalSince1970: snapshot.processor.samplingWindowStart) : nil),
+            gpuWindowEnd: administratorSampleIsFresh && administratorGPUHasValue ? administratorLastUpdated : (snapshot.processor.powerAvailability.contains("gpu") ? Date(timeIntervalSince1970: snapshot.processor.samplingWindowEnd) : nil),
+            cpuSource: rawCPUWatts == nil ? nil : (administratorSampleIsFresh && administratorCPUHasValue ? "powermetrics" : (snapshot.processor.powerAvailability.contains("cpu") ? "IOReport energy model" : "SMC")),
+            gpuSource: rawGPUWatts == nil ? nil : (administratorSampleIsFresh && administratorGPUHasValue ? "powermetrics" : (snapshot.processor.powerAvailability.contains("gpu") ? "IOReport energy model" : "SMC")),
+            cpuQuality: rawCPUWatts == nil ? .unavailable : .estimated,
+            gpuQuality: rawGPUWatts == nil ? .unavailable : .estimated
+        ))
+        alerts.observe(date: lastUpdated, isOnAC: isOnAC,
+                       batteryLevel: batteryPresent ? batteryLevel : nil,
+                       signedBatteryWatts: signedBatteryWatts,
+                       systemWatts: systemLoadAvailable ? systemLoadWatts : nil,
+                       thermalState: ProcessInfo.processInfo.thermalState)
+        diagnostics.updateState(panelVisible: panelVisible, enhancedSampling: administratorSampleIsFresh)
+        if automaticEnhancedSampling && administratorSamplingState == .active && Date().timeIntervalSince(administratorLastUpdated) > 30 {
+            privilegedPowerSampler.stop(withError: "增强数据超过30秒未更新，将静默重试。")
+        }
+        if automaticEnhancedSampling && (administratorSamplingState == .failed || administratorSamplingState == .inactive) {
+            if enhancedRetryCount < 3 && Date() >= nextEnhancedRetry {
+                enhancedRetryCount += 1
+                nextEnhancedRetry = Date().addingTimeInterval(60 * Double(enhancedRetryCount))
+                startAdministratorSampling() // Silent only; never installs on recovery.
+            }
+        }
     }
 
     // MARK: - Sampling
@@ -902,41 +786,13 @@ final class PowerMonitor: ObservableObject {
     ) {
         batteryPresent = snapshot.isPresent
         batteryLevel = snapshot.isPresent ? snapshot.level : -1
-        let smcBatteryPower = smcPower(smc, "PPBR")
-        let measuredPackCharge = snapshot.batteryVoltage
-            * max(0, snapshot.batteryCurrent)
-        let hasBatteryChargeEvidence =
-            PowerMetricsCore.hasCorroboratedChargingPower(
-                telemetrySystemPowerInWatts: snapshot.systemInputWatts,
-                telemetrySystemLoadWatts: snapshot.systemLoadWatts,
-                telemetryBatteryPowerWatts:
-                    snapshot.hasTelemetryBatteryPower
-                        ? snapshot.telemetryBatteryPowerWatts
-                        : nil,
-                positivePackPowerWatts: measuredPackCharge
-            )
-        let smcChargingSignal = smcReadings["CHCC"]?.status == .available
-            && (smc["CHCC"] ?? 0).isFinite
-            && (smc["CHCC"] ?? 0) > 0.001
-            // CHCC can retain a small nonzero value while charging is paused.
-            // PPBR is a discharge rail on this hardware, so corroborate CHCC
-            // with the signed telemetry or whole-pack voltage × current.
-            && hasBatteryChargeEvidence
-        isCharging = snapshot.isPresent
-            && (snapshot.isCharging
-                || (snapshot.isOnAC
-                    && !snapshot.isFullyCharged
-                    && smcChargingSignal))
-        isFullyCharged = snapshot.isPresent
-            && !isCharging
-            && snapshot.isFullyCharged
-        // A desktop Mac has no battery service, but necessarily runs from
-        // external power. Keep that state explicit instead of showing 0% and
-        // "正在使用电池".
+        latestBattery = snapshot
+        isCharging = snapshot.isCharging
+        isFullyCharged = snapshot.isFullyCharged
         isOnAC = snapshot.isPresent ? snapshot.isOnAC : true
         batteryTempC = validTemperature(snapshot.temperatureC)
             ?? validTemperature(smcTemperature(smc, "TB0T", "TB1T", "TB2T"))
-            ?? batteryTempC
+            ?? 0
         batteryTimeText = snapshot.isPresent
             ? (isCharging
                 ? snapshot.timeToFullDescription
@@ -974,45 +830,9 @@ final class PowerMonitor: ObservableObject {
         batteryVoltage = max(0, snapshot.batteryVoltage)
         batteryCurrent = snapshot.batteryCurrent
 
-        // PPBR describes battery discharge on this hardware. It must not
-        // replace the whole-pack charge value while energy is flowing into the
-        // battery; the live PDTR/PSTR balance is applied in updatePowerFlow.
-        let measuredBatteryFlow: Double
-        if isCharging {
-            measuredBatteryFlow = firstPositive(snapshot.batteryFlowWatts)
-        } else if !isOnAC {
-            measuredBatteryFlow = firstPositive(
-                smcBatteryPower,
-                snapshot.batteryFlowWatts
-            )
-        } else {
-            // On AC without a signed discharge signal there is no confirmed
-            // battery flow. PPBR is a magnitude and must not invent direction.
-            measuredBatteryFlow = 0
-        }
-        // Fully charged batteries can expose a sub-2 W balancing/trickle rail
-        // even though no meaningful battery-to-system flow exists. Suppress
-        // that noise so the diagram does not contradict the AC power balance.
-        batteryFlowWatts =
-            !snapshot.isPresent
-                || (isOnAC && isFullyCharged && !isCharging && measuredBatteryFlow < 2)
-                ? 0
-                : measuredBatteryFlow
-
-        if !snapshot.isPresent {
-            batteryFlowDirection = .unavailable
-        } else if isCharging {
-            batteryFlowDirection = .charging
-        } else if !isOnAC {
-            batteryFlowDirection = .supplying
-        } else if isFullyCharged || batteryFlowWatts <= 0.02 {
-            batteryFlowDirection = .idle
-        } else {
-            // PPBR is a live battery-rail magnitude, not a direction signal.
-            // On AC while charging is paused, do not guess whether the battery
-            // is supplementing the adapter.
-            batteryFlowDirection = .unknown
-        }
+        signedBatteryWatts = snapshot.signedBatteryPowerWatts
+        batteryFlowWatts = abs(signedBatteryWatts ?? 0)
+        batteryFlowDirection = !snapshot.isPresent ? .unavailable : .unknown
     }
 
     private func updateProcessor(
@@ -1035,19 +855,25 @@ final class PowerMonitor: ObservableObject {
         fanRPM = max(0, data.fanRPM)
         fan2RPM = max(0, data.fan2RPM)
 
-        cpuPowerWatts = firstPositive(
-            data.cpuPower,
-            smcPower(smc, "PCPT", "PCTR", "PCPR", "PCPC", "PC0C")
-        )
-        gpuPowerWatts = firstPositive(
-            data.gpuPower,
-            smcPower(smc, "PG0R", "PG0C", "PCPG")
-        )
+        powerAvailability = data.powerAvailability
+        samplingStatus = data.sampleStatus
+        sampleDuration = data.sampleDuration
+        func availableSMC(_ keys: [String], domain: String) -> Double? {
+            for key in keys where smcReadings[key]?.status == .available {
+                if let value = smc[key], value.isFinite, value >= 0 {
+                    powerAvailability.insert(domain)
+                    return value
+                }
+            }
+            return nil
+        }
+        cpuPowerWatts = data.powerAvailability.contains("cpu") ? data.cpuPower :
+            (availableSMC(["PCPT", "PCTR", "PCPR", "PCPC", "PC0C"], domain: "cpu") ?? 0)
+        gpuPowerWatts = data.powerAvailability.contains("gpu") ? data.gpuPower :
+            (availableSMC(["PG0R", "PG0C", "PCPG"], domain: "gpu") ?? 0)
         anePowerWatts = nonnegativePower(data.anePower)
-        dramPowerWatts = firstPositive(
-            data.dramPower,
-            smcPower(smc, "PMTR", "PC3C")
-        )
+        dramPowerWatts = data.powerAvailability.contains("dram") ? data.dramPower :
+            (availableSMC(["PMTR", "PC3C"], domain: "dram") ?? 0)
         gpuSRAMPowerWatts = nonnegativePower(data.gpuSRAMPower)
         mediaPowerWatts = nonnegativePower(data.mediaPower)
         ispPowerWatts = nonnegativePower(data.ispPower)
@@ -1058,6 +884,11 @@ final class PowerMonitor: ObservableObject {
             data.displayExtPower
         )
 
+        // A failed sensor must not keep an old temperature looking current.
+        cpuTempC = 0
+        gpuTempC = 0
+        aneTempC = 0
+        dramTempC = 0
         if let temperature = validTemperature(data.cpuTemp) {
             cpuTempC = temperature
         } else if let temperature = validTemperature(smcTemperature(
@@ -1096,79 +927,53 @@ final class PowerMonitor: ObservableObject {
         processor: ProcessorSnapshot,
         smc: [String: Double]
     ) {
-        let smcAdapter = smcPower(smc, "PDTR")
-        let smcSystem = smcPower(smc, "PSTR")
-        let chargingBalance = PowerMetricsCore.resolveChargingPowerBalance(
-            smcPDTRWatts: smcAdapter,
-            smcPSTRWatts: smcSystem,
-            smcPPBRWatts: smcPower(smc, "PPBR"),
-            telemetrySystemPowerInWatts: battery.systemInputWatts,
-            telemetrySystemLoadWatts: battery.systemLoadWatts,
-            telemetryBatteryPowerWatts: battery.hasTelemetryBatteryPower
-                ? battery.telemetryBatteryPowerWatts
-                : nil,
-            packBatteryChargeWatts: battery.packBatteryChargeWatts
+        func knownSMC(_ key: String) -> Double? {
+            smcReadings[key]?.status == .available ? smc[key] : nil
+        }
+        let balance = PowerMetricsCore.resolvePowerBalance(
+            smcPDTRWatts: knownSMC("PDTR"), smcPSTRWatts: knownSMC("PSTR"),
+            telemetrySystemPowerInWatts: battery.hasSystemInputPower ? battery.systemInputWatts : nil,
+            telemetrySystemLoadWatts: battery.hasSystemLoadPower ? battery.systemLoadWatts : nil,
+            telemetryBatteryPowerWatts: battery.hasTelemetryBatteryPower ? battery.telemetryBatteryPowerWatts : nil,
+            signedPackBatteryWatts: battery.packBatteryPowerWatts, isOnAC: isOnAC,
+            telemetryIsUsable: battery.telemetryFreshness != .stale
         )
-
-        let now = Date()
-        let coherentChargingBalance: ChargingPowerBalance?
-        if chargingBalance.source != .unavailable {
-            lastChargingPowerBalance = chargingBalance
-            lastChargingPowerBalanceDate = now
-            coherentChargingBalance = chargingBalance
-        } else if let previous = lastChargingPowerBalance,
-                  now.timeIntervalSince(lastChargingPowerBalanceDate) >= 0,
-                  now.timeIntervalSince(lastChargingPowerBalanceDate)
-                    <= chargingBalanceFreshness {
-            coherentChargingBalance = previous
-        } else {
-            coherentChargingBalance = nil
+        powerBalanceResidual = balance.residualWatts
+        systemLoadAvailable = balance.systemLoadWatts != nil
+        systemLoadWatts = balance.systemLoadWatts ?? 0
+        adapterInputWatts = balance.adapterInputWatts ?? 0
+        signedBatteryWatts = batteryPresent ? balance.signedBatteryWatts : nil
+        batteryFlowWatts = abs(signedBatteryWatts ?? 0)
+        if !batteryPresent { batteryFlowDirection = .unavailable }
+        else if let signed = signedBatteryWatts {
+            if signed > 0.2 { batteryFlowDirection = .charging }
+            else if signed < -0.2 { batteryFlowDirection = .supplying }
+            else { batteryFlowDirection = .idle }
+        } else { batteryFlowDirection = .unknown }
+        isCharging = batteryFlowDirection == .charging
+        isFullyCharged = batteryPresent && battery.isFullyCharged && !isCharging && batteryFlowDirection != .supplying
+        switch batteryFlowDirection {
+        case .charging: batteryTimeText = battery.timeToFullDescription
+        case .supplying: batteryTimeText = isSupplementingAdapter ? "已接电源 · 电池补电" : (isOnAC ? "已接电源 · 电池供电" : battery.timeDescription)
+        case .idle: batteryTimeText = isFullyCharged ? "已充满" : "已接电源 · 未充电"
+        case .unknown: batteryTimeText = "电池流向待确认"
+        case .unavailable: batteryTimeText = "无内置电池"
+        }
+        systemLoadIsEstimated = balance.source != .powerTelemetry && balance.source != .smcPDTRPSTR
+        switch balance.source {
+        case .powerTelemetry: powerSourceLabel = "电源遥测（同源三元组）"
+        case .smcPDTRPSTR: powerSourceLabel = "SMC 输入 / 整机功率"
+        case .adapterAndBattery: powerSourceLabel = "输入与电池推导"
+        case .systemAndBattery: powerSourceLabel = "整机与电池推导"
+        case .batteryOnly: powerSourceLabel = "电池电压 × 电流"
+        case .unavailable: powerSourceLabel = systemLoadAvailable ? "整机功率（电源流向未知）" : "整机功率不可用"
         }
 
-        if isOnAC, isCharging {
-            // Apply all three values from one resolver. Never combine a live
-            // adapter value with a stale battery value: the diagram must keep
-            // input = system load + battery charge on every rendered frame.
-            adapterInputWatts = coherentChargingBalance?.adapterInputWatts ?? 0
-            systemLoadWatts = coherentChargingBalance?.systemLoadWatts ?? 0
-            batteryFlowWatts = coherentChargingBalance?.batteryChargeWatts ?? 0
-            batteryFlowDirection = .charging
-            systemLoadIsEstimated = coherentChargingBalance == nil
-                || coherentChargingBalance?.source == .adapterAndBattery
-                || coherentChargingBalance?.source == .systemAndBattery
-        } else {
-            lastChargingPowerBalance = nil
-            lastChargingPowerBalanceDate = .distantPast
-            adapterInputWatts = firstPositive(
-                smcAdapter,
-                battery.systemInputWatts
-            )
-
-            let balanceEstimate: Double
-            if isOnAC {
-                switch batteryFlowDirection {
-                case .charging:
-                    balanceEstimate = adapterInputWatts - batteryFlowWatts
-                case .supplying:
-                    balanceEstimate = adapterInputWatts + batteryFlowWatts
-                case .idle, .unknown, .unavailable:
-                    balanceEstimate = adapterInputWatts
-                }
-            } else {
-                balanceEstimate = batteryFlowWatts
-            }
-
-            let measuredSystemLoad = firstPositive(
-                smcSystem,
-                battery.systemLoadWatts,
-                processor.systemPower
-            )
-            systemLoadIsEstimated = measuredSystemLoad == 0
-                && balanceEstimate > 0
-            systemLoadWatts = firstPositive(
-                measuredSystemLoad,
-                balanceEstimate
-            )
+        systemHistoryQuality = !systemLoadAvailable ? .unavailable : (systemLoadIsEstimated ? .estimated : .measured)
+        if balance.source == .powerTelemetry && battery.telemetryFreshness != .fresh {
+            // A newly read dictionary may already be cached in the driver.
+            // Display its value with an age warning, but don't invent Wh.
+            systemHistoryQuality = .unavailable
         }
 
         // PBwo is used by newer Apple Silicon systems; PDBR is present on
@@ -1179,7 +984,6 @@ final class PowerMonitor: ObservableObject {
             displayPowerWatts = nonnegativePower(smcPower(smc, "PDBR"))
         }
 
-        reconcileStandardGPUPowerAgainstCurrentBudget()
         updateProcessorAggregatePower(smc: smc)
 
         // These rails are used only when an independently known FourCC is
@@ -1207,51 +1011,6 @@ final class PowerMonitor: ObservableObject {
                 - gpuPowerWatts
                 - effectiveDisplayPowerWatts
         )
-    }
-
-    private func reconcileStandardGPUPowerAgainstCurrentBudget() {
-        let candidate = nonnegativePower(gpuPowerWatts)
-        guard systemLoadWatts.isFinite, systemLoadWatts > 0.02 else {
-            // Preserve the raw standard source for diagnostics when no whole-
-            // system budget exists yet. Effective UI values remain zero until
-            // the budget is known, so the main diagram cannot become invalid.
-            gpuPowerWatts = candidate
-            return
-        }
-
-        let budget = availableProcessorPowerBudgetWatts
-        let now = Date()
-        if isClearlyAbovePowerBudget(candidate, budget: budget) {
-            let age = now.timeIntervalSince(lastReasonableStandardGPUSampleDate)
-            if let previous = lastReasonableStandardGPUPowerWatts,
-               age >= 0,
-               age <= standardGPUFallbackFreshness {
-                gpuPowerWatts = min(previous, budget)
-            } else {
-                gpuPowerWatts = 0
-            }
-            return
-        }
-
-        // A small cross-sampler overshoot is plausible, but the value rendered
-        // in the energy flow must still fit the physical whole-system budget.
-        let reconciled = min(candidate, budget)
-        gpuPowerWatts = reconciled
-        lastReasonableStandardGPUPowerWatts = reconciled
-        lastReasonableStandardGPUSampleDate = now
-    }
-
-    private func isClearlyAbovePowerBudget(
-        _ value: Double,
-        budget: Double
-    ) -> Bool {
-        let safeValue = nonnegativePower(value)
-        let safeBudget = nonnegativePower(budget)
-        let tolerance = max(
-            componentBudgetAbsoluteToleranceWatts,
-            safeBudget * componentBudgetRelativeTolerance
-        )
-        return safeValue > safeBudget + tolerance
     }
 
     private func updateProcessorAggregatePower(smc: [String: Double]) {
@@ -1410,78 +1169,20 @@ final class PowerMonitor: ObservableObject {
     // MARK: - Process activity
 
     private func scheduleProcessRefreshIfNeeded() {
-        guard processTask == nil,
-              Date().timeIntervalSince(lastProcessRefresh) >= processInterval
-        else {
-            return
-        }
-
-        lastProcessRefresh = Date()
+        let now = Date()
+        guard processTask == nil, now.timeIntervalSince(lastProcessRefresh) >= processInterval else { return }
+        lastProcessRefresh = now
+        let sampler = insightsSampler
         processTask = Task { @MainActor [weak self] in
-            let output = await Task.detached(priority: .utility) {
-                Self.runPS()
-            }.value
-
+            let result = await sampler.sample(includeDetails: (self?.panelVisible ?? false) || self?.history.activeSession != nil)
             guard !Task.isCancelled, let self else { return }
-            self.topProcesses = Self.parseProcesses(output)
+            self.insights = result
+            self.topProcesses = (result.topProcesses ?? []).prefix(3).compactMap {
+                guard let cpu = $0.cpuPercent else { return nil }
+                return ActivityProcess(id: Int($0.pid), name: $0.name, cpuPercent: cpu)
+            }
             self.processTask = nil
         }
-    }
-
-    nonisolated private static func runPS() -> String {
-        let process = Process()
-        let outputPipe = Pipe()
-
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axo", "pid=,%cpu=,comm=", "-r"]
-        process.standardOutput = outputPipe
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-        } catch {
-            return ""
-        }
-
-        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-
-    private static func parseProcesses(_ output: String) -> [ActivityProcess] {
-        var result: [ActivityProcess] = []
-        result.reserveCapacity(3)
-
-        for rawLine in output.split(whereSeparator: \.isNewline) {
-            let fields = rawLine.split(
-                maxSplits: 2,
-                omittingEmptySubsequences: true,
-                whereSeparator: \.isWhitespace
-            )
-            guard fields.count == 3,
-                  let pid = Int(fields[0]),
-                  pid > 0,
-                  let cpu = Double(fields[1]),
-                  cpu.isFinite,
-                  cpu >= 0
-            else {
-                continue
-            }
-
-            let command = String(fields[2])
-            let name = URL(fileURLWithPath: command).lastPathComponent
-            if name == "MacPowerFlow" || name == "kernel_task" {
-                continue
-            }
-            result.append(ActivityProcess(
-                id: pid,
-                name: name.isEmpty ? command : name,
-                cpuPercent: cpu
-            ))
-
-            if result.count == 3 { break }
-        }
-        return result
     }
 
     // MARK: - Helpers

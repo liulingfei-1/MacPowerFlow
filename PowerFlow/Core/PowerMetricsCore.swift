@@ -10,6 +10,7 @@ nonisolated enum ChargingPowerBalanceSource: Equatable, Sendable {
     case smcPDTRPSTR
     case adapterAndBattery
     case systemAndBattery
+    case batteryOnly
     case unavailable
 }
 
@@ -18,6 +19,63 @@ nonisolated struct ChargingPowerBalance: Equatable, Sendable {
     let systemLoadWatts: Double
     let batteryChargeWatts: Double
     let source: ChargingPowerBalanceSource
+}
+
+/// Positive battery power means charging, negative means supplying the system.
+/// Optional legs retain the distinction between a measured idle zero and no data.
+nonisolated struct PowerBalance: Equatable, Sendable {
+    let adapterInputWatts: Double?
+    let systemLoadWatts: Double?
+    let signedBatteryWatts: Double?
+    let source: ChargingPowerBalanceSource
+
+    /// Unreconciled watts from independently sampled input/load/pack legs.
+    /// Keeping this visible avoids silently changing a measured idle pack to
+    /// charging merely to force the diagram to add up.
+    var residualWatts: Double? {
+        guard let input = adapterInputWatts, let load = systemLoadWatts,
+              let battery = signedBatteryWatts else { return nil }
+        return input - load - battery
+    }
+
+    var isCoherent: Bool {
+        guard let input = adapterInputWatts, let load = systemLoadWatts,
+              let battery = signedBatteryWatts else { return false }
+        return abs(input - load - battery) <= max(0.25, max(input, load) * 0.02)
+    }
+    var isSupplementingAdapter: Bool {
+        (adapterInputWatts ?? 0) > 0.02 && (signedBatteryWatts ?? 0) < -0.02
+    }
+}
+
+nonisolated enum TelemetryFreshness: String, Equatable, Sendable {
+    case unverified, fresh, stale, unavailable
+}
+
+/// Tracks observations, not a nonexistent hardware timestamp. An unchanged
+/// counter fingerprint eventually becomes stale even when read() keeps running.
+nonisolated struct TelemetryFreshnessState: Sendable {
+    private var fingerprint: String?
+    private var lastChangeUptime: Double?
+    private var hasObservedAdvance = false
+    private(set) var lastChangedAt: Date?
+
+    mutating func observe(fingerprint next: String?, uptime: Double,
+                          date: Date, staleAfter: Double = 10) -> TelemetryFreshness {
+        guard let next else {
+            fingerprint = nil; lastChangeUptime = nil
+            lastChangedAt = nil; hasObservedAdvance = false
+            return .unavailable
+        }
+        guard uptime.isFinite else { return .unverified }
+        if fingerprint != next || lastChangeUptime.map({ uptime < $0 }) == true {
+            hasObservedAdvance = fingerprint != nil && lastChangeUptime.map({ uptime >= $0 }) == true
+            fingerprint = next; lastChangeUptime = uptime; lastChangedAt = date
+        }
+        guard let lastChangeUptime else { return .unverified }
+        if uptime - lastChangeUptime >= staleAfter { return .stale }
+        return hasObservedAdvance ? .fresh : .unverified
+    }
 }
 
 /// Pure power-sample reconciliation shared by the app and regression tests.
@@ -131,6 +189,70 @@ nonisolated enum PowerMetricsCore {
         )
     }
 
+    /// Selects the first available measurement, preserving a legitimate zero.
+    static func firstAvailablePowerWatts(_ candidates: [Double?]) -> Double? {
+        candidates.compactMap(finiteNonnegative).first
+    }
+
+    /// Reconciles signed flow without treating discharge as charge. The atomic
+    /// telemetry tuple wins; asynchronous SMC/pack fallbacks remain derived.
+    static func resolvePowerBalance(
+        smcPDTRWatts: Double?, smcPSTRWatts: Double?,
+        telemetrySystemPowerInWatts: Double?, telemetrySystemLoadWatts: Double?,
+        telemetryBatteryPowerWatts: Double?, signedPackBatteryWatts: Double?,
+        isOnAC: Bool, telemetryIsUsable: Bool = true
+    ) -> PowerBalance {
+        let input = telemetryIsUsable ? finitePower(telemetrySystemPowerInWatts) : nil
+        let load = telemetryIsUsable ? finitePower(telemetrySystemLoadWatts) : nil
+        let battery = telemetryIsUsable ? finiteSignedBatteryPower(telemetryBatteryPowerWatts) : nil
+        let pack = finiteSignedBatteryPower(signedPackBatteryWatts)
+        if let input, let load, let battery,
+           isOnAC || input <= minimumMeaningfulPowerWatts {
+            let tuple = PowerBalance(adapterInputWatts: input, systemLoadWatts: load,
+                                     signedBatteryWatts: battery, source: .powerTelemetry)
+            if tuple.isCoherent { return tuple }
+        }
+        if !isOnAC {
+            // Reject a positive pack sample carried across cable removal.
+            if let pack, pack <= 0 {
+                return PowerBalance(adapterInputWatts: 0, systemLoadWatts: -pack,
+                                    signedBatteryWatts: pack, source: .batteryOnly)
+            }
+            return PowerBalance(adapterInputWatts: 0, systemLoadWatts: nil,
+                                signedBatteryWatts: nil, source: .unavailable)
+        }
+        let smcInput = finitePower(smcPDTRWatts)
+        let smcLoad = finitePower(smcPSTRWatts)
+        // Without all three matching telemetry legs, prefer the live SMC pair.
+        let chosenInput = smcInput ?? input
+        let chosenLoad = smcLoad ?? load
+        if let chosenInput, let chosenLoad {
+            let residual = chosenInput - chosenLoad
+            // Preserve both independently measured legs, even if their windows
+            // disagree strongly. A signed pack reading (including zero) supplies
+            // direction; only a missing pack falls back to the residual. Never
+            // rewrite an available system reading to make the diagram add up.
+            return PowerBalance(adapterInputWatts: chosenInput, systemLoadWatts: chosenLoad,
+                                signedBatteryWatts: pack ?? finiteSignedBatteryPower(residual),
+                                source: smcInput != nil && smcLoad != nil ? .smcPDTRPSTR : .adapterAndBattery)
+        }
+        if let chosenInput, let pack, chosenInput - pack >= 0 {
+            return PowerBalance(adapterInputWatts: chosenInput, systemLoadWatts: chosenInput - pack,
+                                signedBatteryWatts: pack, source: .adapterAndBattery)
+        }
+        if let chosenLoad, let pack, chosenLoad + pack >= 0 {
+            return PowerBalance(adapterInputWatts: chosenLoad + pack, systemLoadWatts: chosenLoad,
+                                signedBatteryWatts: pack, source: .systemAndBattery)
+        }
+        return PowerBalance(adapterInputWatts: chosenInput, systemLoadWatts: chosenLoad,
+                            signedBatteryWatts: pack, source: .unavailable)
+    }
+
+    static func finiteSignedBatteryPower(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, abs(value) < 200 else { return nil }
+        return value
+    }
+
     /// Produces one internally coherent charging tuple for the energy-flow UI.
     ///
     /// A complete PowerTelemetryData tuple is atomic and therefore wins when
@@ -147,73 +269,31 @@ nonisolated enum PowerMetricsCore {
         telemetryBatteryPowerWatts: Double?,
         packBatteryChargeWatts: Double?
     ) -> ChargingPowerBalance {
-        let telemetry = validatedTelemetryChargingBalance(
-            inputWatts: telemetrySystemPowerInWatts,
-            loadWatts: telemetrySystemLoadWatts,
-            batteryWatts: telemetryBatteryPowerWatts
+        _ = smcPPBRWatts // PPBR is not the pack charging rail.
+        let balance = resolvePowerBalance(
+            smcPDTRWatts: smcPDTRWatts, smcPSTRWatts: smcPSTRWatts,
+            telemetrySystemPowerInWatts: telemetrySystemPowerInWatts,
+            telemetrySystemLoadWatts: telemetrySystemLoadWatts,
+            telemetryBatteryPowerWatts: telemetryBatteryPowerWatts,
+            signedPackBatteryWatts: finitePower(packBatteryChargeWatts), isOnAC: true
         )
-        if let telemetry {
-            return telemetry
+        // Compatibility only for the old positive-charge API. Live history and
+        // current monitoring use resolvePowerBalance and retain the raw load.
+        if balance.source != .powerTelemetry,
+           let input = balance.adapterInputWatts, let load = balance.systemLoadWatts,
+           let pack = finitePower(packBatteryChargeWatts), pack > minimumMeaningfulPowerWatts,
+           abs(input - load - pack) > max(3, pack * 0.35), input >= pack {
+            return ChargingPowerBalance(adapterInputWatts: input, systemLoadWatts: input - pack,
+                                        batteryChargeWatts: pack, source: .adapterAndBattery)
         }
-
-        let telemetryInput = meaningfulPower(telemetrySystemPowerInWatts)
-        let telemetryLoad = meaningfulPower(telemetrySystemLoadWatts)
-        let smcInput = meaningfulPower(smcPDTRWatts)
-        let smcLoad = meaningfulPower(smcPSTRWatts)
-        let packCharge = meaningfulPower(packBatteryChargeWatts)
-
-        if let telemetryInput,
-           let telemetryLoad,
-           telemetryInput >= telemetryLoad {
-            return reconcileInputAndLoad(
-                inputWatts: telemetryInput,
-                loadWatts: telemetryLoad,
-                packChargeWatts: packCharge,
-                source: .powerTelemetry
-            )
+        guard balance.isCoherent, let input = balance.adapterInputWatts,
+              let load = balance.systemLoadWatts, let charge = balance.signedBatteryWatts,
+              charge >= 0 else {
+            return ChargingPowerBalance(adapterInputWatts: 0, systemLoadWatts: 0,
+                                        batteryChargeWatts: 0, source: .unavailable)
         }
-
-        if let smcInput, let smcLoad, smcInput >= smcLoad {
-            return reconcileInputAndLoad(
-                inputWatts: smcInput,
-                loadWatts: smcLoad,
-                packChargeWatts: packCharge,
-                source: .smcPDTRPSTR
-            )
-        }
-
-        // If one whole-system leg is missing, combine the remaining live leg
-        // with an independently measured whole-pack charge magnitude and derive
-        // the third value. Publishing a derived coherent tuple is preferable to
-        // mixing three asynchronous values in the energy-flow diagram.
-        if let input = telemetryInput ?? smcInput,
-           let packCharge,
-           input >= packCharge {
-            return ChargingPowerBalance(
-                adapterInputWatts: input,
-                systemLoadWatts: input - packCharge,
-                batteryChargeWatts: packCharge,
-                source: .adapterAndBattery
-            )
-        }
-        if let load = telemetryLoad ?? smcLoad, let packCharge {
-            return ChargingPowerBalance(
-                adapterInputWatts: load + packCharge,
-                systemLoadWatts: load,
-                batteryChargeWatts: packCharge,
-                source: .systemAndBattery
-            )
-        }
-
-        // Keep PPBR in the API so regression tests can prove that a tempting
-        // nonzero value never becomes charging power again.
-        _ = smcPPBRWatts
-        return ChargingPowerBalance(
-            adapterInputWatts: 0,
-            systemLoadWatts: 0,
-            batteryChargeWatts: 0,
-            source: .unavailable
-        )
+        return ChargingPowerBalance(adapterInputWatts: input, systemLoadWatts: load,
+                                    batteryChargeWatts: charge, source: balance.source)
     }
 
     /// CHCC is allowed to recover a missing boolean only when a second,
@@ -237,34 +317,6 @@ nonisolated enum PowerMetricsCore {
             return false
         }
         return pack >= 2
-    }
-
-    private static func reconcileInputAndLoad(
-        inputWatts: Double,
-        loadWatts: Double,
-        packChargeWatts: Double?,
-        source: ChargingPowerBalanceSource
-    ) -> ChargingPowerBalance {
-        let residual = inputWatts - loadWatts
-        if let packChargeWatts,
-           packChargeWatts > minimumMeaningfulPowerWatts,
-           inputWatts >= packChargeWatts {
-            let allowedDrift = max(3, packChargeWatts * 0.35)
-            if abs(residual - packChargeWatts) > allowedDrift {
-                return ChargingPowerBalance(
-                    adapterInputWatts: inputWatts,
-                    systemLoadWatts: inputWatts - packChargeWatts,
-                    batteryChargeWatts: packChargeWatts,
-                    source: .adapterAndBattery
-                )
-            }
-        }
-        return ChargingPowerBalance(
-            adapterInputWatts: inputWatts,
-            systemLoadWatts: loadWatts,
-            batteryChargeWatts: residual,
-            source: source
-        )
     }
 
     private static func validatedTelemetryChargingBalance(

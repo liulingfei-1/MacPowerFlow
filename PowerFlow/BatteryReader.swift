@@ -2,6 +2,40 @@ import Foundation
 import IOKit
 import IOKit.ps
 
+nonisolated struct USBPowerDeliveryProfile: Equatable, Sendable {
+    let index: Int
+    let voltage: Double
+    let current: Double
+    var maximumWatts: Double { voltage * current }
+}
+
+private nonisolated final class BatteryTelemetryTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state = TelemetryFreshnessState()
+    func observe(_ telemetry: [String: Any], date: Date) -> (TelemetryFreshness, Date?) {
+        // Counter changes distinguish a fresh idle sample from a cached zero.
+        let counterKeys = ["SystemPowerInAccumulatorCount", "SystemLoadAccumulatorCount",
+                           "BatteryPowerAccumulatorCount"]
+        let valueKeys = ["SystemPowerIn", "SystemLoad", "BatteryPower"]
+        let counters = counterKeys.compactMap { key in
+            (telemetry[key] as? NSNumber).map { "\(key)=\($0.stringValue)" }
+        }
+        let values = valueKeys.compactMap { key in
+            (telemetry[key] as? NSNumber).map { "\(key)=\($0.stringValue)" }
+        }
+        lock.lock(); defer { lock.unlock() }
+        // Steady watts are legitimate. Without update counters we cannot infer
+        // age merely because two numeric readings match.
+        guard !counters.isEmpty else {
+            _ = state.observe(fingerprint: nil, uptime: ProcessInfo.processInfo.systemUptime, date: date)
+            return (values.isEmpty ? .unavailable : .unverified, nil)
+        }
+        let freshness = state.observe(fingerprint: (counters + values).joined(separator: ";"),
+                                      uptime: ProcessInfo.processInfo.systemUptime, date: date)
+        return (freshness, state.lastChangedAt)
+    }
+}
+
 nonisolated struct BatterySnapshot: Sendable {
     var isPresent = false
     var level = 0
@@ -19,9 +53,27 @@ nonisolated struct BatterySnapshot: Sendable {
     var timeToFullMinutes = 0
     var timeToEmptyMinutes = 0
 
-    /// Positive means energy is flowing into or out of the battery, with the
-    /// direction described by `isCharging` / `isOnAC`.
+    /// Magnitude only; use signedBatteryPowerWatts for direction, including AC supplement.
     var batteryFlowWatts = 0.0
+    var signedBatteryPowerWatts: Double?
+    var packBatteryPowerWatts: Double?
+    var hasSystemInputPower = false
+    var hasSystemLoadPower = false
+    var observedAt = Date()
+    var telemetryFreshness: TelemetryFreshness = .unavailable
+    /// When this process last observed a change, not a hardware sample timestamp.
+    var telemetryLastChangedAt: Date?
+    var pdProfiles: [USBPowerDeliveryProfile] = []
+    var currentPDProfileIndex: Int?
+    var chargerNotChargingReason: Int?
+    var chargerSlowChargingReason: Int?
+    var chargerThermallyLimitedTime: Double?
+    var isSupplementingAdapter: Bool {
+        isOnAC && (signedBatteryPowerWatts ?? 0) < -0.02
+    }
+    var currentPDProfile: USBPowerDeliveryProfile? {
+        pdProfiles.first { $0.index == currentPDProfileIndex }
+    }
     var batteryVoltage = 0.0
     var batteryCurrent = 0.0
     var systemLoadWatts = 0.0
@@ -33,6 +85,7 @@ nonisolated struct BatterySnapshot: Sendable {
     var systemInputVoltage = 0.0
     var systemInputCurrent = 0.0
     var adapterEfficiencyLossWatts = 0.0
+    /// Negotiated USB allocation; never subtract this as measured external consumption.
     var externalPowerOutWatts = 0.0
 
     var adapterRatedWatts = 0.0
@@ -44,6 +97,7 @@ nonisolated struct BatterySnapshot: Sendable {
         if isCharging {
             return formattedMinutes(timeToFullMinutes)
         }
+        if isSupplementingAdapter { return "已接电源 · 电池补电" }
         if isFullyCharged { return "已充满" }
         if isOnAC { return "已接电源 · 未充电" }
         return formattedMinutes(timeToEmptyMinutes)
@@ -64,6 +118,7 @@ nonisolated struct BatterySnapshot: Sendable {
 }
 
 enum BatteryReader {
+    private nonisolated static let telemetryTracker = BatteryTelemetryTracker()
     nonisolated static func read() -> BatterySnapshot {
         let powerSource = readPowerSourceState()
         let service = IOServiceGetMatchingService(
@@ -156,6 +211,22 @@ enum BatteryReader {
             result.timeToEmptyMinutes = firstInt("TimeRemaining", fallback: [:])
         }
 
+        result.pdProfiles = (adapter["UsbHvcMenu"] as? [[String: Any]] ?? []).compactMap { profile in
+            guard let index = int(profile["Index"]),
+                  let millivolts = numberValue(profile["MaxVoltage"]),
+                  let milliamps = numberValue(profile["MaxCurrent"]),
+                  millivolts.isFinite, milliamps.isFinite,
+                  millivolts > 0, milliamps > 0,
+                  millivolts <= 50_000, milliamps <= 10_000 else { return nil }
+            return USBPowerDeliveryProfile(index: index, voltage: millivolts / 1000,
+                                           current: milliamps / 1000)
+        }
+        result.currentPDProfileIndex = int(adapter["UsbHvcHvcIndex"])
+        result.chargerNotChargingReason = int(chargerData["NotChargingReason"])
+        result.chargerSlowChargingReason = int(chargerData["SlowChargingReason"])
+        result.chargerThermallyLimitedTime = numberValue(chargerData["TimeChargingThermallyLimited"])
+        (result.telemetryFreshness, result.telemetryLastChangedAt) = telemetryTracker.observe(
+            telemetry, date: result.observedAt)
         result.adapterRatedWatts = number(adapter["Watts"])
         result.adapterVoltage = number(adapter["AdapterVoltage"]) / 1000.0
         result.adapterCurrent = number(adapter["Current"]) / 1000.0
@@ -183,47 +254,40 @@ enum BatteryReader {
             result.telemetryBatteryPowerWatts = signedTelemetryPowerWatts
             result.hasTelemetryBatteryPower = true
         }
-        let telemetryResidual = result.systemInputWatts
-            - result.systemLoadWatts
-        let telemetryTolerance = max(
-            0.25,
-            result.systemInputWatts * 0.02
+        result.hasSystemInputPower = telemetrySystemInputMW.map {
+            $0.isFinite && $0 >= 0 && $0 < 1_000_000
+        } ?? false
+        result.hasSystemLoadPower = telemetrySystemLoadMW.map {
+            $0.isFinite && $0 >= 0 && $0 < 1_000_000
+        } ?? false
+        let registryOnAC = bool(property("ExternalConnected")) ?? false
+        let rawRegistryOnAC = bool(property("AppleRawExternalConnected")) ?? false
+        let physicallyOnAC = registryOnAC || rawRegistryOnAC || powerSource.isOnAC
+        let telemetryBalance = PowerMetricsCore.resolvePowerBalance(
+            smcPDTRWatts: nil, smcPSTRWatts: nil,
+            telemetrySystemPowerInWatts: result.hasSystemInputPower ? result.systemInputWatts : nil,
+            telemetrySystemLoadWatts: result.hasSystemLoadPower ? result.systemLoadWatts : nil,
+            telemetryBatteryPowerWatts: result.hasTelemetryBatteryPower ? signedTelemetryPowerWatts : nil,
+            signedPackBatteryWatts: nil, isOnAC: physicallyOnAC,
+            telemetryIsUsable: result.telemetryFreshness != .stale
         )
-        result.hasPowerTelemetryBalance =
-            telemetrySystemInputMW != nil
-                && telemetrySystemLoadMW != nil
-                && result.hasTelemetryBatteryPower
-                && result.systemInputWatts > 0.02
-                && result.systemInputWatts >= result.systemLoadWatts
-                && abs(
-                    telemetryResidual - result.telemetryBatteryPowerWatts
-                ) <= telemetryTolerance
+        result.hasPowerTelemetryBalance = telemetryBalance.source == .powerTelemetry
+            && telemetryBalance.isCoherent
         let rawBatteryVoltage = Double(firstInt("Voltage"))
-        let rawBatteryCurrent = Double(
-            signedInt(property("InstantAmperage"))
-                ?? signedInt(property("Amperage"))
-                ?? 0
-        )
+        let currentReading = signedNumber(property("InstantAmperage"))
+            ?? signedNumber(property("Amperage"))
+        let rawBatteryCurrent = currentReading ?? 0
         result.batteryVoltage = rawBatteryVoltage / 1000.0
         result.batteryCurrent = rawBatteryCurrent / 1000.0
-        let chargingVoltage = number(chargerData["ChargingVoltage"])
         let chargingCurrent = number(chargerData["ChargingCurrent"])
-        let gaugePowerWatts = saneBatteryPower(
-            rawBatteryVoltage * rawBatteryCurrent / 1_000_000.0
-        )
-        let telemetryPowerWatts = saneBatteryPower(
-            (telemetryBatteryMW ?? 0) / 1_000.0
-        )
-        let packBatteryPowerWatts = firstPositive(
-            gaugePowerWatts,
-            saneBatteryPower(
-                rawBatteryVoltage * chargingCurrent / 1_000_000.0
-            ),
-            saneBatteryPower(
-                chargingVoltage * chargingCurrent / 1_000_000.0
-            )
-        )
-        result.packBatteryChargeWatts = packBatteryPowerWatts
+        let signedPackWatts = rawBatteryVoltage > 0 && currentReading != nil
+            ? PowerMetricsCore.finiteSignedBatteryPower(rawBatteryVoltage * rawBatteryCurrent / 1_000_000)
+            : nil
+        result.packBatteryPowerWatts = signedPackWatts
+        // Never use the unsigned charger current limit as measured battery current.
+        result.packBatteryChargeWatts = max(0, signedPackWatts ?? 0)
+        result.signedBatteryPowerWatts = result.hasPowerTelemetryBalance
+            ? telemetryBalance.signedBatteryWatts : signedPackWatts
         let resolvedState = BatteryStateCore.resolve(
             BatteryStateSignals(
                 registryIsCharging: bool(property("IsCharging")) ?? false,
@@ -232,32 +296,24 @@ enum BatteryReader {
                 registryFullyCharged: (bool(property("FullyCharged")) ?? false)
                     || (bool(batteryData["FullyCharged"]) ?? false),
                 powerSourcesFullyCharged: powerSource.isFullyCharged,
-                registryOnAC: bool(property("ExternalConnected")) ?? false,
-                rawRegistryOnAC: bool(property("AppleRawExternalConnected"))
-                    ?? false,
+                registryOnAC: registryOnAC,
+                rawRegistryOnAC: rawRegistryOnAC,
                 powerSourcesOnAC: powerSource.isOnAC,
                 chargingCurrentMilliamps: chargingCurrent,
-                hasMeasuredBatteryPower: gaugePowerWatts > 0.02
-                    || telemetryPowerWatts > 0.02
+                hasMeasuredBatteryPower: (result.signedBatteryPowerWatts ?? 0) > 0.02,
+                signedBatteryPowerWatts: result.signedBatteryPowerWatts
             )
         )
         result.isCharging = resolvedState.isCharging
         result.isFullyCharged = resolvedState.isFullyCharged
         result.isOnAC = resolvedState.isOnAC
 
-        if result.isCharging {
-            result.batteryFlowWatts = firstPositive(
-                result.hasPowerTelemetryBalance ? telemetryPowerWatts : 0,
-                packBatteryPowerWatts
-            )
-        } else if !result.isOnAC {
-            result.batteryFlowWatts = firstPositive(
-                telemetryPowerWatts,
-                gaugePowerWatts
-            )
-        } else {
-            result.batteryFlowWatts = 0
+        // AC presence and battery direction are independent: a weak adapter can
+        // supply part of the system load while the battery supplies the rest.
+        if !result.isOnAC, (result.signedBatteryPowerWatts ?? 0) > 0 {
+            result.signedBatteryPowerWatts = signedPackWatts.flatMap { $0 <= 0 ? $0 : nil }
         }
+        result.batteryFlowWatts = abs(result.signedBatteryPowerWatts ?? 0)
 
         result.externalPowerOutWatts = readExternalPower(property("PowerOutDetails"))
         return result
@@ -326,15 +382,6 @@ enum BatteryReader {
         values.first { $0 > 0 && $0 < 65_535 } ?? 0
     }
 
-    nonisolated private static func firstPositive(_ values: Double...) -> Double {
-        values.first { $0.isFinite && $0 > 0.02 } ?? 0
-    }
-
-    nonisolated private static func saneBatteryPower(_ value: Double) -> Double {
-        let magnitude = abs(value)
-        return magnitude.isFinite && magnitude < 200 ? magnitude : 0
-    }
-
     nonisolated private static func saneWholeSystemPower(
         _ value: Double
     ) -> Double {
@@ -352,11 +399,10 @@ enum BatteryReader {
         }
 
         return entries.reduce(0) { partial, item in
-            // `Watts` is the live value on current Apple Silicon releases.
-            // Older/private schemas can expose only `PDPowermW`; do not use it
-            // when a present `Watts` field is legitimately zero.
+            // These private fields describe allocation/negotiation, not verified
+            // instantaneous device consumption. Preserve a legitimate zero.
             let raw = number(item["Watts"] ?? item["PDPowermW"])
-            return partial + raw / 1000.0
+            return partial + (raw.isFinite && raw >= 0 && raw < 1_000_000 ? raw / 1000.0 : 0)
         }
     }
 
@@ -364,11 +410,6 @@ enum BatteryReader {
         if let number = value as? NSNumber { return number.intValue }
         if let value = value as? Int { return value }
         return nil
-    }
-
-    nonisolated private static func signedInt(_ value: Any?) -> Int? {
-        if let number = value as? NSNumber { return number.intValue }
-        return value as? Int
     }
 
     nonisolated private static func number(_ value: Any?) -> Double {
@@ -386,7 +427,10 @@ enum BatteryReader {
     }
 
     nonisolated private static func signedNumber(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber { return Double(number.int64Value) }
+        if let number = value as? NSNumber {
+            let type = String(cString: number.objCType)
+            return type == "f" || type == "d" ? number.doubleValue : Double(number.int64Value)
+        }
         if let value = value as? Int64 { return Double(value) }
         if let value = value as? Int { return Double(value) }
         return nil

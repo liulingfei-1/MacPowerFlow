@@ -515,6 +515,233 @@ final class PowerMetricsCoreTests: XCTestCase {
         XCTAssertTrue(state.isFullyCharged)
     }
 
+    func testSignedTelemetryHandlesReal20WAdapterSupplementFixture() throws {
+        let balance = signedBalance(input: 19.402, load: 31.891, battery: -12.489, pack: -16.155545)
+        XCTAssertEqual(balance.source, .powerTelemetry)
+        XCTAssertEqual(try XCTUnwrap(balance.systemLoadWatts), 31.891, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(balance.signedBatteryWatts), -12.489, accuracy: 0.000001)
+        XCTAssertTrue(balance.isSupplementingAdapter)
+        XCTAssertTrue(balance.isCoherent)
+    }
+
+    func testSignedIdleZeroIsAvailableRatherThanMissing() {
+        let balance = signedBalance(input: 20, load: 20, battery: 0)
+        XCTAssertEqual(balance.signedBatteryWatts, 0)
+        XCTAssertEqual(balance.source, .powerTelemetry)
+        XCTAssertFalse(balance.isSupplementingAdapter)
+        XCTAssertEqual(PowerMetricsCore.firstAvailablePowerWatts([0, 7]), 0)
+        XCTAssertNil(PowerMetricsCore.firstAvailablePowerWatts([nil, .nan, -1]))
+    }
+
+    func testMissingBatteryPowerIsNotInventedAsZero() {
+        let balance = signedBalance(input: nil, load: nil, battery: nil)
+        XCTAssertNil(balance.signedBatteryWatts)
+        XCTAssertNil(balance.systemLoadWatts)
+        XCTAssertFalse(balance.isCoherent)
+    }
+
+    func testChargingAndBatteryOnlySignedBalance() {
+        let charge = signedBalance(input: 80, load: 50, battery: 30)
+        XCTAssertEqual(charge.signedBatteryWatts, 30)
+        let discharge = signedBalance(input: nil, load: nil, battery: nil, pack: -15, onAC: false)
+        XCTAssertEqual(discharge.adapterInputWatts, 0)
+        XCTAssertEqual(discharge.systemLoadWatts, 15)
+        XCTAssertEqual(discharge.source, .batteryOnly)
+    }
+
+    func testInvalidSignedPowerCannotCreateAValidBalance() {
+        for invalid in [Double.nan, .infinity, -.infinity, 200, -200] {
+            let balance = signedBalance(input: nil, load: nil, battery: invalid, pack: invalid)
+            XCTAssertNil(balance.signedBatteryWatts)
+            XCTAssertFalse(balance.isCoherent)
+        }
+    }
+
+    func testSignedPackFallbackAddsDischargeToAdapterRatherThanSubtracting() throws {
+        let balance = signedBalance(input: 19.402, load: nil, battery: nil, pack: -16.155545)
+        XCTAssertEqual(try XCTUnwrap(balance.systemLoadWatts), 35.557545, accuracy: 0.000001)
+        XCTAssertEqual(balance.source, .adapterAndBattery)
+        XCTAssertTrue(balance.isSupplementingAdapter)
+    }
+
+    func testNegativeAtomicPowerOverridesEveryStaleChargingBoolean() {
+        var signals = batterySignals(registryIsCharging: true, chargerIsCharging: true,
+                                     powerSourcesIsCharging: true, registryOnAC: true)
+        signals.signedBatteryPowerWatts = -12.489
+        let state = BatteryStateCore.resolve(signals)
+        XCTAssertTrue(state.isOnAC)
+        XCTAssertFalse(state.isCharging)
+    }
+
+    func testZeroBatteryPowerOverridesStaleChargingBoolean() {
+        var signals = batterySignals(registryIsCharging: true, registryFullyCharged: true, registryOnAC: true)
+        signals.signedBatteryPowerWatts = 0
+        let state = BatteryStateCore.resolve(signals)
+        XCTAssertFalse(state.isCharging)
+        XCTAssertTrue(state.isFullyCharged)
+    }
+
+    func testUnpluggedNegativePackDoesNotInheritACFromStaleChargeFlag() {
+        var signals = batterySignals(registryIsCharging: true)
+        signals.signedBatteryPowerWatts = -15
+        let state = BatteryStateCore.resolve(signals)
+        XCTAssertFalse(state.isOnAC)
+        XCTAssertFalse(state.isCharging)
+        let balance = signedBalance(input: 80, load: 50, battery: 30, pack: -15, onAC: false)
+        XCTAssertEqual(balance.systemLoadWatts, 15)
+        XCTAssertEqual(balance.source, .batteryOnly)
+    }
+
+    func testUnpluggedPositivePackCannotInventACFromLaggingChargeFlag() {
+        var signals = batterySignals(registryIsCharging: true)
+        signals.signedBatteryPowerWatts = 15
+        let state = BatteryStateCore.resolve(signals)
+        XCTAssertFalse(state.isOnAC)
+        XCTAssertFalse(state.isCharging)
+    }
+
+    func testStaleTelemetryIsExcludedAndSignedPackControlsDirection() {
+        let balance = signedBalance(input: 80, load: 50, battery: 30, pack: -15, usable: false)
+        XCTAssertNil(balance.adapterInputWatts)
+        XCTAssertEqual(balance.signedBatteryWatts, -15)
+        XCTAssertEqual(balance.source, .unavailable)
+    }
+
+    func testUnknownSignedPowerRetainsExistingBooleanFallback() {
+        var signals = batterySignals(registryIsCharging: true, registryOnAC: true)
+        for unknown: Double? in [nil, .nan, .infinity] {
+            signals.signedBatteryPowerWatts = unknown
+            XCTAssertTrue(BatteryStateCore.resolve(signals).isCharging)
+        }
+    }
+
+    func testDirectionTransitionsDoNotCarryPriorTuple() {
+        for battery in [30.0, 0, -12, 0, 5] {
+            var signals = batterySignals(registryIsCharging: true, registryOnAC: true)
+            signals.signedBatteryPowerWatts = battery
+            XCTAssertEqual(BatteryStateCore.resolve(signals).isCharging, battery > 0)
+            let balance = signedBalance(input: 20, load: 20 - battery, battery: battery)
+            if battery <= 20 { XCTAssertEqual(balance.signedBatteryWatts, battery) }
+        }
+    }
+
+    func testRepeatedCachedTelemetryBecomesStaleWithoutForgingHardwareTimestamp() {
+        var freshness = TelemetryFreshnessState()
+        let start = Date(timeIntervalSince1970: 100)
+        XCTAssertEqual(freshness.observe(fingerprint: "a", uptime: 10, date: start), .unverified)
+        XCTAssertEqual(freshness.observe(fingerprint: "a", uptime: 19, date: start.addingTimeInterval(9)), .unverified)
+        XCTAssertEqual(freshness.observe(fingerprint: "a", uptime: 20, date: start.addingTimeInterval(10)), .stale)
+        XCTAssertEqual(freshness.lastChangedAt, start)
+        XCTAssertEqual(freshness.observe(fingerprint: "b", uptime: 21, date: start.addingTimeInterval(11)), .fresh)
+        XCTAssertEqual(freshness.lastChangedAt, start.addingTimeInterval(11))
+        XCTAssertEqual(freshness.observe(fingerprint: nil, uptime: 22, date: start), .unavailable)
+        XCTAssertNil(freshness.lastChangedAt)
+    }
+
+    func testFullIdlePackDoesNotBecomeChargingFromSmallSMCResidual() throws {
+        let balance = PowerMetricsCore.resolvePowerBalance(
+            smcPDTRWatts: 17.661, smcPSTRWatts: 17.264,
+            telemetrySystemPowerInWatts: 17.264, telemetrySystemLoadWatts: 17.264,
+            telemetryBatteryPowerWatts: 0, signedPackBatteryWatts: 0,
+            isOnAC: true, telemetryIsUsable: false)
+        XCTAssertEqual(balance.adapterInputWatts, 17.661)
+        XCTAssertEqual(balance.systemLoadWatts, 17.264)
+        XCTAssertEqual(balance.signedBatteryWatts, 0)
+        XCTAssertEqual(balance.source, .smcPDTRPSTR)
+        XCTAssertEqual(try XCTUnwrap(balance.residualWatts), 0.397, accuracy: 0.000001)
+        var signals = batterySignals(registryIsCharging: true, registryFullyCharged: true, registryOnAC: true)
+        signals.signedBatteryPowerWatts = balance.signedBatteryWatts
+        let state = BatteryStateCore.resolve(signals)
+        XCTAssertFalse(state.isCharging)
+        XCTAssertTrue(state.isFullyCharged)
+    }
+
+    func testLowMeasuredPackFlowsArePreservedDespiteContradictingSMCDifference() {
+        for pack in [-0.3, -0.05, 0, 0.05, 0.3] {
+            let balance = PowerMetricsCore.resolvePowerBalance(
+                smcPDTRWatts: 17, smcPSTRWatts: 17.397,
+                telemetrySystemPowerInWatts: nil, telemetrySystemLoadWatts: nil,
+                telemetryBatteryPowerWatts: nil, signedPackBatteryWatts: pack,
+                isOnAC: true)
+            XCTAssertEqual(balance.signedBatteryWatts, pack)
+            XCTAssertEqual(balance.systemLoadWatts, 17.397)
+            XCTAssertEqual(balance.adapterInputWatts, 17)
+            var signals = batterySignals(registryOnAC: true)
+            signals.signedBatteryPowerWatts = balance.signedBatteryWatts
+            XCTAssertEqual(BatteryStateCore.resolve(signals).isCharging, pack > 0.02)
+        }
+    }
+
+    func testSMCStillDerivesBatteryWhenPackGaugeIsMissingOrInvalid() throws {
+        for pack: Double? in [nil, .nan, .infinity] {
+            let balance = PowerMetricsCore.resolvePowerBalance(
+                smcPDTRWatts: 17.661, smcPSTRWatts: 17.264,
+                telemetrySystemPowerInWatts: nil, telemetrySystemLoadWatts: nil,
+                telemetryBatteryPowerWatts: nil, signedPackBatteryWatts: pack,
+                isOnAC: true)
+            XCTAssertEqual(try XCTUnwrap(balance.signedBatteryWatts), 0.397, accuracy: 0.000001)
+            XCTAssertEqual(try XCTUnwrap(balance.residualWatts), 0, accuracy: 0.000001)
+        }
+    }
+
+    func testCoherentAtomicChargingTupleStillWinsOverDifferentPackWindow() {
+        let balance = PowerMetricsCore.resolvePowerBalance(
+            smcPDTRWatts: 17.661, smcPSTRWatts: 17.264,
+            telemetrySystemPowerInWatts: 17.661, telemetrySystemLoadWatts: 17.264,
+            telemetryBatteryPowerWatts: 0.397, signedPackBatteryWatts: 0,
+            isOnAC: true)
+        XCTAssertEqual(balance.source, .powerTelemetry)
+        XCTAssertEqual(balance.signedBatteryWatts, 0.397)
+    }
+
+    func testLargeSMCResidualWithIdlePackPreservesRawSystemLoad() throws {
+        let balance = PowerMetricsCore.resolvePowerBalance(
+            smcPDTRWatts: 19.07, smcPSTRWatts: 12,
+            telemetrySystemPowerInWatts: nil, telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil, signedPackBatteryWatts: 0, isOnAC: true)
+        XCTAssertEqual(balance.adapterInputWatts, 19.07)
+        XCTAssertEqual(balance.systemLoadWatts, 12)
+        XCTAssertEqual(balance.signedBatteryWatts, 0)
+        XCTAssertEqual(balance.source, .smcPDTRPSTR)
+        XCTAssertEqual(try XCTUnwrap(balance.residualWatts), 7.07, accuracy: 0.000001)
+        XCTAssertFalse(balance.isCoherent)
+    }
+
+    func testLargeSMCResidualConflictingWithDischargingPackKeepsAllMeasuredLegs() {
+        let balance = PowerMetricsCore.resolvePowerBalance(
+            smcPDTRWatts: 20, smcPSTRWatts: 10,
+            telemetrySystemPowerInWatts: nil, telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil, signedPackBatteryWatts: -12, isOnAC: true)
+        XCTAssertEqual(balance.adapterInputWatts, 20)
+        XCTAssertEqual(balance.systemLoadWatts, 10)
+        XCTAssertEqual(balance.signedBatteryWatts, -12)
+        XCTAssertEqual(balance.residualWatts, 22)
+        XCTAssertFalse(balance.isCoherent)
+    }
+
+    func testImpossibleResidualDoesNotEraseKnownInputAndSystemReadings() {
+        let balance = PowerMetricsCore.resolvePowerBalance(
+            smcPDTRWatts: 400, smcPSTRWatts: 10,
+            telemetrySystemPowerInWatts: nil, telemetrySystemLoadWatts: nil,
+            telemetryBatteryPowerWatts: nil, signedPackBatteryWatts: nil, isOnAC: true)
+        XCTAssertEqual(balance.adapterInputWatts, 400)
+        XCTAssertEqual(balance.systemLoadWatts, 10)
+        XCTAssertNil(balance.signedBatteryWatts)
+        XCTAssertEqual(balance.source, .smcPDTRPSTR)
+        XCTAssertFalse(balance.isCoherent)
+    }
+
+    private func signedBalance(input: Double?, load: Double?, battery: Double?,
+                               pack: Double? = nil, onAC: Bool = true,
+                               usable: Bool = true) -> PowerBalance {
+        PowerMetricsCore.resolvePowerBalance(
+            smcPDTRWatts: nil, smcPSTRWatts: nil,
+            telemetrySystemPowerInWatts: input, telemetrySystemLoadWatts: load,
+            telemetryBatteryPowerWatts: battery, signedPackBatteryWatts: pack,
+            isOnAC: onAC, telemetryIsUsable: usable
+        )
+    }
+
     private func batterySignals(
         registryIsCharging: Bool = false,
         chargerIsCharging: Bool = false,

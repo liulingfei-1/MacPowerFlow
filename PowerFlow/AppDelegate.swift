@@ -6,7 +6,8 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject,
     NSApplicationDelegate,
-    NSMenuDelegate
+    NSMenuDelegate,
+    NSPopoverDelegate
 {
     private let contentWidth: CGFloat = 420
     private let maximumContentHeight: CGFloat = 720
@@ -56,6 +57,62 @@ final class AppDelegate: NSObject,
         }
         updateStatusItem()
 
+        if ProcessInfo.processInfo.arguments.contains("--diagnose-startup") {
+            // Uses the ordinary automatic startup path, including the silent
+            // helper preflight. Never requests installation authorization.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 16) { [weak self] in
+                guard let self else { return }
+                let report: [String: Any] = [
+                    "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
+                    "hasHardwareSample": self.model.lastUpdated != .distantPast,
+                    "systemLoadWatts": self.model.systemLoadWatts,
+                    "batteryLevel": self.model.batteryLevel,
+                    "enhancedState": String(describing: self.model.administratorSamplingState),
+                    "enhancedMessage": self.model.administratorErrorMessage,
+                    "enhancedSampleCount": self.model.administratorSampleCount,
+                    "powerSource": self.model.powerSourceLabel,
+                    "systemLoadAvailable": self.model.systemLoadAvailable,
+                    "signedBatteryWatts": self.model.signedBatteryWatts as Any? ?? NSNull(),
+                    "cpuRawWatts": self.model.rawCPUWatts as Any? ?? NSNull(),
+                    "gpuRawWatts": self.model.rawGPUWatts as Any? ?? NSNull(),
+                    "powerDomains": self.model.powerAvailability.sorted(),
+                    "sampleDuration": self.model.sampleDuration,
+                    "samplingStatus": self.model.samplingStatus,
+                    "historyPoints": self.model.history.points.count,
+                    "memoryAvailable": self.model.insights?.memory != nil,
+                    "processCount": self.model.insights?.topProcesses?.count ?? 0,
+                    "gpuActivityAvailable": self.model.insights?.gpuActivityAvailable ?? false,
+                    "telemetryFreshness": self.model.latestBattery?.telemetryFreshness.rawValue ?? "unknown",
+                    "diagnostics": self.model.diagnostics.summary,
+                    "launchAtLoginStatus": SMAppService.mainApp.status.rawValue,
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: report, options: [.sortedKeys]) {
+                    FileHandle.standardOutput.write(data)
+                    FileHandle.standardOutput.write(Data("\n".utf8))
+                }
+                if let path = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--render-details=") })?.dropFirst("--render-details=".count) {
+                    let view = InsightsView(model: self.model, initiallyExpanded: true)
+                        .padding(16).frame(width: 420).background(Color.black)
+                        .environment(\.colorScheme, .dark)
+                    // AppKit-backed controls cannot be rendered by ImageRenderer.
+                    let host = NSHostingView(rootView: view)
+                    host.frame = NSRect(origin: .zero, size: host.fittingSize)
+                    let renderWindow = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+                    renderWindow.contentView = host
+                    host.layoutSubtreeIfNeeded()
+                    if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                        host.cacheDisplay(in: host.bounds, to: bitmap)
+                        if let png = bitmap.representation(using: .png, properties: [:]) {
+                            try? png.write(to: URL(fileURLWithPath: String(path)))
+                        }
+                    }
+                    renderWindow.orderOut(nil)
+                }
+                self.model.history.flush()
+                NSApp.terminate(nil)
+            }
+        }
+
         if isAboutPreview {
             showAbout(nil)
         } else if isPreviewMode {
@@ -76,6 +133,7 @@ final class AppDelegate: NSObject,
 
     private func configurePopover() {
         let contentHeight = preferredContentHeight(on: NSScreen.main)
+        popover.delegate = self
         popover.behavior = .transient
         popover.animates = true
         popover.contentSize = NSSize(
@@ -121,6 +179,14 @@ final class AppDelegate: NSObject,
         )
         refreshItem.target = self
         contextMenu.addItem(refreshItem)
+
+        let enhancedItem = NSMenuItem(
+            title: "启用或更新增强采样…",
+            action: #selector(enableEnhancedSampling(_:)),
+            keyEquivalent: ""
+        )
+        enhancedItem.target = self
+        contextMenu.addItem(enhancedItem)
 
         let loginItem = NSMenuItem(
             title: "登录时启动",
@@ -221,6 +287,8 @@ final class AppDelegate: NSObject,
             batteryState = model.batteryFlowWatts > 0.02
                 ? "，正在充电 · 充入 \(Self.formatWatts(model.batteryFlowWatts))"
                 : "，正在充电"
+        } else if model.isSupplementingAdapter {
+            batteryState = "，电池正在补电 · 输出 \(Self.formatWatts(model.batteryFlowWatts))"
         } else if model.isFullyCharged {
             batteryState = "，已充满"
         } else if model.batteryPresent && model.isOnAC {
@@ -477,6 +545,7 @@ final class AppDelegate: NSObject,
             backing: .buffered,
             defer: false
         )
+        model.setPanelVisible(true)
         window.title = "MacPowerFlow"
         window.isReleasedWhenClosed = false
         window.contentViewController = NSHostingController(
@@ -532,6 +601,11 @@ final class AppDelegate: NSObject,
     @objc
     private func refreshNow(_ sender: Any?) {
         model.refreshNow()
+    }
+
+    @objc
+    private func enableEnhancedSampling(_ sender: Any?) {
+        model.startAdministratorSampling(allowInstallation: true)
     }
 
     @objc
@@ -725,6 +799,9 @@ final class AppDelegate: NSObject,
     private func quit(_ sender: Any?) {
         NSApp.terminate(nil)
     }
+
+    func popoverWillShow(_ notification: Notification) { model.setPanelVisible(true) }
+    func popoverDidClose(_ notification: Notification) { model.setPanelVisible(false) }
 
     func menuWillOpen(_ menu: NSMenu) {
         updateLaunchAtLoginItem()

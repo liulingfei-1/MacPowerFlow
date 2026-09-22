@@ -13,6 +13,8 @@ nonisolated struct BatteryStateSignals: Equatable, Sendable {
     let powerSourcesOnAC: Bool
     let chargingCurrentMilliamps: Double
     let hasMeasuredBatteryPower: Bool
+    /// A coherent telemetry tuple or validated signed pack reading; positive charges.
+    var signedBatteryPowerWatts: Double? = nil
 }
 
 nonisolated struct ResolvedBatteryState: Equatable, Sendable {
@@ -26,8 +28,8 @@ nonisolated struct ResolvedBatteryState: Equatable, Sendable {
 /// `IsCharging`, IOPowerSources and the charger's current can briefly disagree
 /// around cable insertion, optimized charging and charge completion. A real
 /// positive charger current is accepted only when AC, a non-full state and a
-/// measured battery-power magnitude corroborate it. Pack-current sign is not
-/// used for direction because some gauges expose it through unsigned wrappers.
+/// measured positive battery power corroborate it. A validated signed sample
+/// takes precedence over lagging charging booleans, including a real idle zero.
 nonisolated enum BatteryStateCore {
     static let meaningfulCurrentMilliamps = 20.0
 
@@ -46,9 +48,14 @@ nonisolated enum BatteryStateCore {
             && signals.hasMeasuredBatteryPower
             && signals.chargingCurrentMilliamps
                 > meaningfulCurrentMilliamps
-        let isOnAC = preliminaryOnAC || currentCorroboratesCharging
-        let isCharging = isOnAC
-            && (explicitChargingSignal || currentCorroboratesCharging)
+        let signedPower = signals.signedBatteryPowerWatts.flatMap {
+            $0.isFinite && abs($0) < 200 ? $0 : nil
+        }
+        let physicallyConnected = signals.registryOnAC
+            || signals.rawRegistryOnAC || signals.powerSourcesOnAC
+        let isOnAC = signedPower != nil ? physicallyConnected : preliminaryOnAC
+        let isCharging = isOnAC && (signedPower.map { $0 > 0.02 }
+            ?? (explicitChargingSignal || currentCorroboratesCharging))
 
         // Active charge wins over a stale full flag. Both flags can coexist for
         // one or more samples while the battery controller changes state.
