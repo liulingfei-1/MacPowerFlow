@@ -1,173 +1,123 @@
 # MacPowerFlow
 
-[![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-blue)](https://github.com/liulingfei-1/MacPowerFlow)
-[![Language](https://img.shields.io/badge/language-Swift-orange)](https://swift.org)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+<img src="Design/IconSource.svg" width="96" alt="MacPowerFlow 图标">
+
+**在 Mac 菜单栏里，看清电从哪里来、用到了哪里。**
+
 [![Release](https://img.shields.io/github/v/release/liulingfei-1/MacPowerFlow)](https://github.com/liulingfei-1/MacPowerFlow/releases/latest)
+[![Platform](https://img.shields.io/badge/macOS-13%2B-blue)](#安装)
+[![Apple Silicon](https://img.shields.io/badge/芯片-Apple%20Silicon-black)](#安装)
+[![License](https://img.shields.io/github/license/liulingfei-1/MacPowerFlow)](LICENSE)
 
+MacPowerFlow 是一个开源的 Mac 功耗监视器。平时，菜单栏显示电量和整机功耗；点开后，可以看充电器、电池和各个部件之间的能量流向，也能进一步查看温度、内存压力和进程活动。
 
-MacPowerFlow 是一款面向 Apple Silicon Mac 的轻量级菜单栏功耗监视器。它在同一面板中汇总电源适配器、整机、电池以及 CPU、GPU、神经网络引擎和内存功耗，并用主能量流视图展示电力从哪里进入、又被哪些部分消耗。
+如果你想知道接着充电器为什么还在掉电，或者想比较一次编译、视频导出前后的功耗变化，可以从这里看起。
 
-![MacPowerFlow 图标源稿](Design/IconSource.svg)
+[下载最新版](https://github.com/liulingfei-1/MacPowerFlow/releases/latest) · [更新记录](CHANGELOG.md) · [反馈问题](https://github.com/liulingfei-1/MacPowerFlow/issues) · [开发文档](docs/DEVELOPMENT.md)
 
-## 下载
+## 安装
 
-从 [GitHub Releases](https://github.com/liulingfei-1/MacPowerFlow/releases/latest) 下载最新 ZIP，解压后把 `MacPowerFlow.app` 拖入“应用程序”。当前公开包使用 hardened ad-hoc 签名但尚未 Apple 公证；如果 macOS 首次阻止启动，请在 Finder 中右键应用选择“打开”，或前往“系统设置 → 隐私与安全性”确认打开。
+需要 **Apple Silicon Mac（M1 或更新芯片）和 macOS 13 或更高版本**。目前不支持 Intel Mac。没有内置电池的机型会显示外接电源状态；不同机型能读到的传感器有所不同。
 
-## 功能
+### 下载安装包
 
-- 菜单栏把电量数字直接放入电池图标，省略百分号、分隔圆点和额外空格，紧接整机实时负载；充电时电池变绿，未充电时保持系统标签色。
-- 用连续块状能量流展示适配器、电池、整机、CPU、GPU、显示和“其他”残差；各流道宽度与实时功耗联动，文字放在与流道连体的安全节点内，极低或极高功耗都不会相互遮挡。
-- 流图按整机预算调整支路布局；超预算时 CPU/GPU 同步收敛，仅作用于示意图。详情、历史与导出保留原始值及采样窗口，并提示发生了显示调整。
-- 自动启动静默连接已安装的增强服务；缺少服务或版本不匹配时继续标准采样。需要增强数据时，从右键菜单选择“启用或更新增强采样…”完成一次管理员授权。冷启动连接超时不会触发重装或密码框。
-- 展示电池温度、循环次数、按满充/设计容量估算的健康度、容量和预计充满或用尽时间。
-- 展示电池与适配器的实时输入电压、电流和功率，以及转换损耗与外接设备分配额度（非实测输出功率）；充电器协商的电压、电流和功率上限会单独标为“协商上限”，不再与实时输入混淆。
-- 主视觉直接展示 CPU 与 GPU 功耗；展开区只补充 ANE、DRAM、媒体引擎、ISP、芯片互联和 PCIe 等未在主图中单列的可用分项，避免重复。
-- 展示整机功耗、CPU 平均/热点温度、GPU 温度/频率、CPU 集群活跃度与频率、双风扇转速和 DRAM 读写带宽。
-- “其他”优先列出 ANE、内存、媒体引擎等可读通道；没有独立瓦数的剩余部分显示为未归因，不分配给网络、风扇等设备。
-- 列出当前 CPU 占用排序靠前的最多三个进程；这里的百分比不是逐应用功耗瓦数。
-- 对缺失或暂时不可用的传感器显示“—”，有效 0 W 保留零；增强字段缺失时使用可用标准通道，不按 CPU 活动比例伪造瓦数。
-- “关于 MacPowerFlow”提供 GitHub 仓库、当前版本、实际采用的开源参考项目，以及可在应用内选择复制的完整许可证与第三方声明。
+1. 打开 [Releases](https://github.com/liulingfei-1/MacPowerFlow/releases/latest)，下载 `MacPowerFlow-版本号.zip`。
+2. 解压，把 `MacPowerFlow.app` 拖入“应用程序”文件夹。
+3. 打开应用，在屏幕顶部菜单栏找到电量和功耗。它不会出现在 Dock 中。
 
-功耗采样并非严格同时发生，而且 CPU、GPU、ANE、DRAM 只是整机功耗的一部分。它们的合计不会等于整机功耗；屏幕、SSD、无线模块、电源转换损耗等也会消耗电力。
+当前安装包尚未经过 Apple 公证。如果 macOS 阻止打开，请先确认文件来自本仓库的 Releases，再按系统提示到“系统设置 → 隐私与安全性”允许打开。
 
-## 系统要求
-
-- Apple Silicon Mac（M1 或更新系列）。
-- macOS 13.0 或更高版本。
-- 从源码构建时使用 Xcode 27 或更新版本（新诊断 API 需要27 SDK；部署目标仍为 macOS 13）。
-
-Intel Mac 不在当前支持范围内。没有内置电池的 Mac mini、Mac Studio 和 Mac Pro 会自动显示外接电源视图，不会虚构电池状态。不同芯片、Mac 型号和 macOS 版本公开的传感器名称并不完全一致，因此部分数据可能显示为不可用。
-
-## 构建
-
-### 使用 Xcode
-
-1. 打开 `MacPowerFlow.xcodeproj`。
-2. 选择 `MacPowerFlow` scheme 和 “My Mac” 运行目标。
-3. 按 `Command-R` 构建并运行。
-
-工程的部署目标是 macOS 13.0，目标架构为 Apple Silicon。应用以菜单栏程序运行，不在 Dock 中显示。
-
-### 构建本地 Release
-
-在项目根目录运行：
+### 使用 Homebrew
 
 ```bash
-./scripts/build_release.sh
+brew tap liulingfei-1/macpowerflow
+brew install --cask macpowerflow
 ```
 
-脚本会：
-
-1. 在独立临时目录中执行 arm64 Release 构建；
-2. 按 helper、安装器、外层 App 的顺序进行 hardened ad-hoc 签名，并逐项验证；
-3. 生成并解包复验不携带 Finder 扩展属性的 `dist/MacPowerFlow-1.6.0.zip`；
-4. 如果已有旧版本，先把它安全地移动到 `.build/previous-releases/`，而不是直接删除。
-
-分发或安装时使用压缩包：双击解压后，把 `MacPowerFlow.app` 拖入“应用程序”文件夹。发布目录不额外保留裸 `.app`，因为 Finder 或同步目录可能在其上重新附加扩展属性并破坏签名；构建脚本会直接复验 ZIP 解包后的应用。
-
-ad-hoc 签名只适合本机开发和测试；“登录时启动”也应在应用移入“应用程序”文件夹后设置。向其他用户正式分发时，应改用有效的 Developer ID Application 证书，并完成 Apple 公证。
-
-## 使用
-
-启动后，MacPowerFlow 会出现在菜单栏并定期刷新采样。自动启动仅尝试免密连接；首次安装或更新后，请右键选择“启用或更新增强采样…”完成一次管理员认证。以后重新打开应用或重启电脑会静默连接。服务启动较慢时最多进行 16 次连接尝试；失败后保留标准采样，可手动重试。左键点击图标可打开功耗面板；右键点击可立即刷新、设置登录时启动、查看“关于”或退出应用。首次开启“登录时启动”会直接注册主应用；如果 macOS 要求额外批准，菜单会保持半选状态并引导到“系统设置 → 通用 → 登录项与扩展”。用于界面验收的 `--preview`、`--preview-charging` 和 `--preview-about` 启动参数会跳过增强服务安装与连接。
-
-应用不需要辅助功能、屏幕录制或完全磁盘访问权限。它不读取或保存密码，也不修改 `sudoers`。首次认证的用途会在系统对话框中说明；只有用户批准后才安装 launchd 管理的 root helper。
-
-### 关于管理员权限
-
-MacPowerFlow 的界面与常规硬件采样始终以当前用户身份运行。首次批准时，一次性安装器只会写入以下固定项目：
-
-- `/Library/PrivilegedHelperTools/com.llf.MacPowerFlow.PrivilegedHelper`
-- `/Library/LaunchDaemons/com.llf.MacPowerFlow.PrivilegedHelper.plist`
-- `/Library/Application Support/com.llf.MacPowerFlow/helper-config.plist`
-
-root helper 只开放“协议版本、开始采样、停止采样”三个固定 XPC 操作。它不接受客户端传入的命令、可执行路径、参数、环境变量或输出文件；内部只能运行 `/usr/bin/powermetrics` 的固定只读参数。应用退出时只停止当前连续流，不注销 launchd 服务，因此下一次启动无需再次认证。
-
-安装器会把当前 App 的签名标识和精确 CDHash 写入 root 所有、不可由普通用户修改的配置。helper 在接受连接前由系统验证这一精确要求；同名伪造应用不能连接。主应用也会反向验证已安装 helper 与包内 helper 的精确签名哈希。
-
-首次认证期间，主应用不会直接以 root 执行位于普通用户可写 App 包内的安装器。它先让系统自带的 `/usr/bin/install` 把已验签的 helper 与安装器复制到 `/Library/PrivilegedHelperTools` 下两个固定、root 所有的临时路径，再从该只读位置重新比对 identifier 与 CDHash；只有完全一致才运行安装器。安装器不接收来源路径、目标路径或 shell 命令，完成或失败后都会清理临时文件。
-
-管理员流提供 Apple 单独计算的 CPU、GPU、ANE、CPU+GPU+ANE 合计、频率、活跃度和热压力。helper 使用无缓冲 plist 管道，并在冷启动暂无完整帧时请求即时采样和刷新输出；解析器兼容 NUL 位于帧前或帧后的输出，也会在完整 XML 到达时立即处理首帧。应用给首帧保留 60 秒安全窗口，稳定采样的新鲜度判断仍为 8 秒。主视觉中的 CPU / GPU 会逐项优先使用最近且仍然新鲜的增强数据；若 `cpu_power` 暂时为 0 或缺失，解析器先使用同一采样窗的 `cpu_energy / elapsed_ns` 还原平均功率，再依次尝试增强合计残差、普通 IOReport 通道和本地 CPU 模型。GPU / ANE 的零值帧也使用相同的能量字段回退。
-
-`powermetrics` 自己也明确说明这些功耗数字来自能耗模型，可能不准确，而且不适合跨设备比较。为保持面板紧凑，界面不再给数值添加来源前缀；`CPU+GPU+ANE` 合计仍不会被当作整机功耗，“其他”仍由整机负载扣除 CPU、GPU 与显示得到。
-
-本地构建 ZIP 使用 hardened ad-hoc 签名，安装时会精确绑定当前 App。日常自动启动不会弹出密码框；若替换 App 二进制，CDHash 会变化，用户需从菜单主动授权更新增强服务。这样避免让旧 root helper 无条件信任任意新文件。
-
-若要正式分发并在升级后继续保持稳定身份，应使用同一 Team 的 Developer ID Application 签名、公证，并迁移到 Apple 推荐的 `SMAppService` LaunchDaemon。当前构建脚本采用固定版本的 ad-hoc 签名安装方式，尚未实现上述正式分发迁移。
-
-如需完整移除增强服务，可在终端运行以下精确命令；它们只删除 MacPowerFlow 的固定系统项目和可能残留的两个安装临时文件：
+通过 Homebrew 安装的版本，可以这样更新。
 
 ```bash
-sudo launchctl bootout system/com.llf.MacPowerFlow.PrivilegedHelper 2>/dev/null || true
-sudo rm -f /Library/PrivilegedHelperTools/com.llf.MacPowerFlow.PrivilegedHelper
-sudo rm -f /Library/PrivilegedHelperTools/.com.llf.MacPowerFlow.PrivilegedHelper.staging
-sudo rm -f /Library/PrivilegedHelperTools/.com.llf.MacPowerFlow.PrivilegedInstaller.staging
-sudo rm -f /Library/LaunchDaemons/com.llf.MacPowerFlow.PrivilegedHelper.plist
-sudo rm -f "/Library/Application Support/com.llf.MacPowerFlow/helper-config.plist"
-sudo rmdir "/Library/Application Support/com.llf.MacPowerFlow" 2>/dev/null || true
+brew update
+brew upgrade --cask macpowerflow
 ```
 
-## 数据来源
+## 可以看什么
 
-| 数据 | 来源 | 说明 |
-| --- | --- | --- |
-| 电池电量、状态、温度、容量、循环、时间 | 公开 IOPowerSources 状态 + IOKit `AppleSmartBattery` IORegistry 属性 | 合并 `Is Charging`、AC 状态和原始电池属性；电源变化通知会触发立即刷新 |
-| 电池实时功率与充电佐证 | `PowerTelemetryData`、AppleSMC `PDTR` / `PSTR` / `PPBR` / `CHCC` | 充电优先采用同一 `PowerTelemetryData` 样本中的 `SystemPowerIn`、`SystemLoad`、`BatteryPower` 三元组，缺失时使用 `PDTR - PSTR`，并以整包电压 × 电流校验或补齐缺腿；短暂缺帧只沿用上一份完整三元组，不再混用异步值。`PPBR` 仅用于电池放电，`CHCC` 只佐证充电状态，不作为瓦数显示 |
-| 适配器实时输入与协商上限 | `PowerTelemetryData`、AppleSMC `PDTR`，以及 `AdapterDetails` / `ChargerData` | 实时电压、电流、功率与充电器协商或声明的上限分开显示；字段是否存在取决于机型和系统版本 |
-| 整机、适配器、显示、无线网络、USB、SoC 热功耗和芯片温度 | AppleSMC 已知只读键，例如 `PSTR`、`PDTR`、`PDBR`、`wiPm`、`PUSB`、`PHPC` | 启动时枚举 `#KEY` 能力表；只有语义已核对的键进入界面，未知键仅用于诊断 |
-| CPU/GPU/ANE/DRAM、GPU SRAM、媒体、ISP、Fabric、PCIe、显示控制器功耗 | IOReport 的 Energy Model / Energy Counters 通道 | 私有、未文档化接口；使用 连续周期 相邻能量样本差值抑制短窗尖峰，不同机型只显示实际存在的通道 |
-| 管理员 CPU/GPU/ANE 功耗、频率、活跃度和热压力 | Apple `/usr/bin/powermetrics` 的 NUL 分隔 plist 输出 | 首次批准后由受限 root helper 运行固定参数、单条应用会话级连续流；优先读取平均功率 mW，零值或缺帧时用同帧能量 mJ 和 `elapsed_ns` 还原 W |
-| CPU 回退模型 | 可见 SoC 功耗残差；缺失时使用整机负载与 CPU tick 活跃度的保守曲线 | 仅在拿不到新鲜管理员 CPU 字段和普通 CPU 能量通道时使用 |
-| “其他”未覆盖分项模型 | “其他”残差预算与整机负载、内存带宽、芯片活跃度、风扇转速代理信号 | 只分配直接通道未覆盖的剩余量，合计不会超过“其他”预算 |
-| CPU 集群活跃度与频率、GPU 使用率与频率 | IOReport 的 CPU Stats / GPU Stats 通道 | 使用 DVFS 状态驻留时间换算 |
-| DRAM 读写带宽 | IOReport 的 AMC Stats；新平台回退 PMP DRAM BW | 显示真实活动速率，不把带宽换算为功耗 |
-| 风扇转速 | AppleSMC `F0Ac`、`F1Ac` | 只读 RPM；风扇功率没有可靠的通用换算 |
-| CPU 使用率 | Mach `host_processor_info` 的相邻 tick 差值 | 系统级 CPU 活跃度 |
-| 低电量模式 | Foundation `ProcessInfo` | Apple 提供的公开系统状态接口 |
-| 高 CPU 进程 | 系统 `ps` 命令 | 仅采集进程名与 CPU 百分比，不把它描述为逐应用瓦数 |
+| 你关心的事 | 应用里能看到的内容 |
+| --- | --- |
+| 这台 Mac 现在用了多少电 | 整机功耗，以及 CPU、GPU、显示和其他功耗的流向图 |
+| 充电器够不够用 | 实时输入、协商的电压和电流档位，以及电池是在充电、闲置还是补充供电 |
+| 为什么发热或变慢 | CPU/GPU 温度、风扇转速、内存压力、压缩内存和 Swap |
+| 哪些活动比较多 | CPU 占用靠前的进程、GPU 活动时间、磁盘和网络读写速率，以及阻止空闲睡眠的进程 |
+| 刚才那项任务用了多少电 | 功耗历史、任务能耗估算、峰值和平均值，可以导出 CSV 或 JSON |
 
-适配器“协商上限”代表充电器协商或声明的电压、电流和功率上限，不等同于此刻的实时输入。界面会把两者分开显示，并在同源遥测可用时保持“适配器输入 = 整机负载 + 电池充入”的功率守恒关系。
+支持的机型还可以显示神经网络引擎（ANE）、内存和媒体引擎等功耗。读不到的项目会标为不可用，不会补出一个看似精确的数字。
 
-## 权限、隐私与发布限制
+## 开始使用
 
-- 当前实现是只读监视器，不调用 SMC 写入接口。
-- 界面和常规监控不以 root 运行；首次用户批准后只安装固定只读 helper，不写入 `/etc/sudoers.d`。
-- helper 用当前 App 的精确代码签名要求限制 XPC 客户端，且不提供任意 root 命令接口。
-- 数据在本机处理；应用不需要联网，也不包含遥测上报。
-- IOReport 和 AppleSMC 不是面向第三方应用承诺兼容性的公开 API，macOS 更新后可能需要适配。
-- 由于使用私有接口且关闭 App Sandbox，本项目不适合提交 Mac App Store。
-- 推荐使用 Developer ID 签名、公证后在 Mac App Store 之外分发。
+**左键点击菜单栏图标**打开主面板，查看功耗流向和硬件读数。展开“诊断与历史”，可以看到充电详情、内存与进程活动，以及历史曲线。
 
-## 开源方案
+想记录一次任务，可以在“功耗历史”里填一个名称，比如“导出视频”，点击“开始记录”。完成任务后点击“结束任务记录”，再查看累计能耗。W 表示功率，Wh 表示一段时间内消耗的能量。
 
-本项目在实现和兼容性处理上参考了 macpow、MacMonitor、Powerflow、WhatBattery 和 mactop，并在管理员采样设计前核对了 pumas、macmon、powermetrics-go 与 monmon 对 `powermetrics` 流式 plist 和字段口径的处理，避免重复猜测已有格式。持久 helper 的生命周期还核对了 Apple 的 SMAppService 示例、SecureXPC、Objective-See BlockBlock 和 Lidless；只借鉴受限协议、连接生命周期与签名验证思路，没有复制示例中接受所有客户端或暴露任意 shell 命令的不安全做法。MacPowerFlow 的解析器和固定安装流程按本应用的数据模型独立实现。相关改编项目的版权与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+**右键点击菜单栏图标**可以立即刷新、设置“登录时启动”、启用增强采样或退出应用。如果登录启动需要额外批准，菜单会提示你到系统设置中处理。
 
-MacPowerFlow 自身采用 [MIT License](LICENSE)。
+“持续异常时通知”默认关闭。手动开启后，应用会申请通知权限。高功耗、高温、低电量或接电时电池补电持续 30 秒才提醒，同类提醒至少间隔 10 分钟。
 
-发布的 `.app` 会在 `Contents/Resources` 内同时携带自身许可证和第三方声明。
+## 标准采样和增强采样
 
+**直接打开就能使用标准采样，无需管理员密码。** 功耗、充电诊断、历史和活动详情中可用的数据都会正常显示。
 
-## 启动回归检查
+增强采样通过 macOS 的 `powermetrics` 补充 CPU、GPU、ANE 等读数。需要时，右键选择“启用或更新增强采样…”，在系统对话框里完成一次管理员授权。
 
-使用完整 Xcode 的 `DEVELOPER_DIR`，并将测试产物放在本地临时目录，避免 File Provider 扩展属性干扰签名：
+同一个构建安装好增强服务后，日常启动会直接连接。更换版本或重新编译后，可能需要主动授权更新一次。自动启动不会因为连接超时反复弹出密码框；服务不可用时，应用继续使用标准采样。
 
-```bash
-swift test --scratch-path /tmp/macpowerflow-core-tests
-bash scripts/test_privileged_runner.sh
-```
+## 怎样理解这些数字
 
-`MacPowerFlow.app/Contents/MacOS/MacPowerFlow --diagnose-startup` 运行正常的静默启动流程，16 秒后输出本机采样与增强状态 JSON 并退出。它不会授权安装服务；冷启动中的增强服务在这份短时快照中可能尚未就绪。
+这些读数适合观察同一台 Mac 的负载变化，也能帮助排查充电和耗电问题。CPU/GPU 等功耗包含 Apple 能量模型的估算，**不能当作经过校准的功率计读数，也不适合直接比较不同机型的能效**。
 
+- 充电器标称或协商的 100W 是供电上限，当前输入可能只有十几瓦。外设的分配额度也不等于实际耗电。
+- 插着电源仍然可能消耗电池。负载超过电源能提供的功率时，电池会一起给电脑供电。
+- “其他”是未分到主图部件的剩余功耗。没有独立传感器的数据不会按固定比例分给无线网络、风扇等设备。
+- 不同来源的读数可能不同步。流图有时会按整机预算调整显示，详情和导出保留原始值，并说明调整情况。
+- 进程 CPU 百分比和 GPU 活动时间反映忙碌程度，不能换算成该应用的精确瓦数。
+- 历史能耗只统计有效采样时段。休眠、缺失或过期数据会留下空白，不计成零功耗，也不补算未知时段。
 
-## 1.6.0 诊断与历史
+历史最多保留最近 24 小时、20,000 个采样点和 100 个已完成任务。持续高频采样时，点数上限可能先达到。
 
-展开主面板的“诊断与历史”，可查看 PD 协商档位、带符号电池功率、来源/新鲜度、原始 CPU/GPU 功率、内存压力/压缩/Swap、进程 CPU 与 GPU 活动时间、物理网卡/磁盘吞吐及防休眠声明。所有未知字段保留未知，合法零值保留零；网络/风扇等未测量部分不再按固定权重分配瓦数。
+## 常见问题
 
-普通能量采样使用连续相邻计数器差分；面板/任务记录时2秒、后台5秒、低电量模式后台10秒。进程/GPU/断言/I/O详情仅在面板打开或记录任务时采集，普通后台只更新内存。睡眠/唤醒和计数重置重新建立基线。
+### 某些读数为什么没有显示？
 
-历史最多保留24小时/20,000点、100个任务会话，保存在本机 Application Support/MacPowerFlow。导出 CSV/JSON 包含原始值、来源、质量及各自时间窗；Wh为有效时段的积分估算，缺失/过期/睡眠区间不填零，也不跨空白积分。CPU/GPU能量模型与GPU活动ms/s不等于独立物理功率计或每应用瓦数。
+不同芯片和 macOS 版本提供的数据不同，传感器也可能暂时没有更新。“不可用”和真实的 0W 会分别处理。可以先查看“诊断与历史”中的来源与状态；升级系统后仍有异常，欢迎提交 Issue。
 
-持续异常通知默认关闭。手动开启后才申请系统通知权限；高功耗、高温、低电和补电持续30秒提醒，同类10分钟冷却。macOS27+接入MetricKit/StateReporting，仅本地保存限量、筛选后的自身诊断报告；其他系统降级，未收到日报时正常等待。
+### 它自己会不会很耗资源？
 
-新增回归脚本：`scripts/test_hardware_sampler.sh`（`--live`可实测）、`scripts/test_system_insights.sh`（`--smoke`可实测）。正式跨版本身份与公证仍需Developer ID签名环境；当前使用精确CDHash约束，每次换构建需手动更新增强服务一次，自动启动从不请求安装授权。
+主面板打开或记录任务时，硬件数据约每 2 秒更新；后台约每 5 秒更新，低电量模式下后台约每 10 秒更新。进程、GPU、网络和磁盘详情按需采集，后台不持续扫描这些详情。实际开销会随设备和系统变化。
+
+### 数据会上传吗？
+
+采样数据在本机处理，历史和诊断保存在 `~/Library/Application Support/MacPowerFlow`。应用没有遥测上传功能，日常监控无需联网。
+
+macOS 27 上还会接收系统提供的应用自身诊断报告，用于了解 MacPowerFlow 的运行情况。这些报告只保存在本机；尚未收到系统日报时，显示等待是正常的。旧系统仍可使用其他功能。
+
+### 能调风扇或限制充电吗？
+
+当前版本只读数据，不修改风扇转速或充电设置。
+
+### 怎样卸载？
+
+先从右键菜单退出应用，再把它移到废纸篓。Homebrew 用户可以运行 `brew uninstall --cask macpowerflow`。
+
+如果安装过增强采样服务，还需要移除它的系统文件，步骤见 [完整卸载说明](docs/TECHNICAL.md#完整卸载)。普通卸载会保留本地历史，方便以后重新安装。
+
+## 开发与反馈
+
+源码构建需要 Xcode 27 或更新版本，步骤和测试命令见 [开发文档](docs/DEVELOPMENT.md)。想了解采样来源、权限和服务设计，可以看 [技术说明](docs/TECHNICAL.md)。
+
+反馈读数问题时，请附上 Mac 芯片、macOS 和应用版本，以及当时是否接电、是否启用增强采样。若有截图或导出文件，提交前请检查其中的进程名称和其他个人信息。
+
+## 致谢与许可
+
+MacPowerFlow 参考了 [macpow](https://github.com/k06a/macpow)、[MacMonitor](https://github.com/ryyansafar/MacMonitor)、[Powerflow](https://github.com/lzt1008/powerflow)、[WhatBattery](https://github.com/darrylmorley/whatbattery)、[mactop](https://github.com/metaspartan/mactop)、[macmon](https://github.com/vladkens/macmon) 和 [Stats](https://github.com/exelban/stats) 的实现与经验。
+
+项目采用 [MIT License](LICENSE)。第三方版权与许可保留在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，也随应用一起分发。
